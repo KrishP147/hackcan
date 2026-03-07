@@ -80,6 +80,30 @@ async def apply_resize(frame_public_id: str, mask_public_id: str,
     return url
 
 
+async def apply_delete(frame_public_id: str, mask_public_id: str) -> str:
+    """Remove masked object using Cloudinary generative AI."""
+    url = cloudinary.CloudinaryImage(frame_public_id).build_url(
+        transformation=[
+            {"overlay": mask_public_id.replace("/", ":"), "flags": "layer_apply"},
+            {"effect": "gen_remove", "prompt": "remove the masked object"},
+        ],
+        secure=True,
+    )
+    return url
+
+
+async def apply_add(frame_public_id: str, prompt: str, x: int, y: int, w: int, h: int) -> str:
+    """Generate object from prompt and overlay at position."""
+    url = cloudinary.CloudinaryImage(frame_public_id).build_url(
+        transformation=[
+            {"effect": f"gen_replace:from_natural;to_{prompt}",
+             "x": x, "y": y, "width": w, "height": h, "crop": "fill"},
+        ],
+        secure=True,
+    )
+    return url
+
+
 async def download_url(url: str, save_path: Path):
     async with httpx.AsyncClient() as client:
         resp = await client.get(url)
