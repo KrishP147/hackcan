@@ -131,7 +131,7 @@ async def segment_object(req: SegmentRequest):
 
     mask = sam2_service.segment_frame(frame_path, req.click_x, req.click_y)
     mask_count = sam2_service.propagate_masks(
-        project_dir / "frames", req.frame_index, mask, masks_dir
+        project_dir / "original.mp4", req.frame_index, req.click_x, req.click_y, masks_dir
     )
 
     return {
@@ -168,105 +168,130 @@ class EditRequest(BaseModel):
     project_id: str
     edit_rules: List[EditRule]
 
+async def _background_edit(project_id: str, edit_rules: List[EditRule]):
+    """Background task: upload frames, apply edit rules, track progress in status.json."""
+    try:
+        project_dir = project_manager.get_project_dir(project_id)
+        frames_dir = project_dir / "frames"
+        masks_dir = project_dir / "masks"
+        edited_dir = project_dir / "edited"
+        edited_dir.mkdir(exist_ok=True)
+
+        frame_files = sorted(frames_dir.glob("frame_*.jpg"))
+        mask_files = sorted(masks_dir.glob("mask_*.png"))
+        total_frames = len(frame_files)
+
+        project_manager.update_status(
+            project_id,
+            edit_status="uploading",
+            edit_progress={"done": 0, "total": total_frames},
+        )
+
+        # Upload all frames to Cloudinary
+        frame_ids = {}
+        for f in frame_files:
+            result = cloudinary_service.upload_file(str(f), folder=f"frameshift/{project_id}/frames")
+            frame_ids[f.name] = result["public_id"]
+
+        # Upload masks if they exist
+        mask_ids = {}
+        for m in mask_files:
+            result = cloudinary_service.upload_file(str(m), folder=f"frameshift/{project_id}/masks")
+            mask_ids[m.name] = result["public_id"]
+
+        # Compute mask bbox for positioning edits
+        bbox_x, bbox_y, bbox_w, bbox_h = 0, 0, 0, 0
+        if mask_files:
+            from PIL import Image
+            import numpy as np
+            anchor_mask = np.array(Image.open(mask_files[0]))
+            rows = np.any(anchor_mask > 0, axis=1)
+            cols = np.any(anchor_mask > 0, axis=0)
+            if rows.any() and cols.any():
+                y_min, y_max = np.where(rows)[0][[0, -1]]
+                x_min, x_max = np.where(cols)[0][[0, -1]]
+                bbox_x, bbox_y = int(x_min), int(y_min)
+                bbox_w, bbox_h = int(x_max - x_min), int(y_max - y_min)
+
+        frame_list = sorted(frame_ids.keys())
+        mask_list = sorted(mask_ids.keys())
+
+        frames_to_edit = set()
+        for rule in edit_rules:
+            for i in range(rule.start_frame, min(rule.end_frame + 1, total_frames + 1)):
+                frames_to_edit.add(i)
+
+        project_manager.update_status(project_id, edit_status="editing")
+        completed = 0
+
+        async def process_frame(index):
+            nonlocal completed
+            frame_name = frame_list[index - 1]
+            f_id = frame_ids[frame_name]
+            m_id = mask_ids.get(mask_list[index - 1], "") if index - 1 < len(mask_list) else ""
+
+            if index not in frames_to_edit:
+                shutil.copy2(str(frames_dir / frame_name), str(edited_dir / f"frame_{index:04d}.jpg"))
+            else:
+                url = None
+                for rule in edit_rules:
+                    if rule.start_frame <= index <= rule.end_frame:
+                        if rule.edit_type == "recolor" and m_id:
+                            url = await cloudinary_service.apply_recolor(f_id, m_id, rule.color)
+                        elif rule.edit_type == "resize" and m_id:
+                            url = await cloudinary_service.apply_resize(f_id, m_id, bbox_x, bbox_y, bbox_w, bbox_h, rule.scale)
+                        elif rule.edit_type == "replace" and m_id:
+                            url = await cloudinary_service.apply_replace(f_id, m_id, bbox_x, bbox_y, bbox_w, bbox_h)
+                        elif rule.edit_type == "delete" and m_id:
+                            url = await cloudinary_service.apply_delete(f_id, m_id)
+                        elif rule.edit_type == "add":
+                            url = await cloudinary_service.apply_add(
+                                f_id, rule.prompt,
+                                rule.asset_x or bbox_x, rule.asset_y or bbox_y,
+                                rule.asset_w or bbox_w, rule.asset_h or bbox_h,
+                            )
+                        break
+
+                save_path = edited_dir / f"frame_{index:04d}.jpg"
+                if url:
+                    await cloudinary_service.download_url(url, save_path)
+                else:
+                    shutil.copy2(str(frames_dir / frame_name), str(save_path))
+
+            completed += 1
+            project_manager.update_status(
+                project_id,
+                edit_progress={"done": completed, "total": total_frames},
+            )
+
+        batch_size = 20
+        for i in range(0, total_frames, batch_size):
+            batch = [process_frame(j + 1) for j in range(i, min(i + batch_size, total_frames))]
+            await asyncio.gather(*batch)
+
+        project_manager.update_status(
+            project_id,
+            edit_status="done",
+            edit_progress={"done": total_frames, "total": total_frames},
+        )
+
+    except Exception as e:
+        project_manager.update_status(project_id, edit_status="error", edit_error=str(e))
+
+
 @app.post("/edit")
-async def edit_frames(req: EditRequest):
+async def edit_frames(req: EditRequest, background_tasks: BackgroundTasks):
     project_dir = project_manager.get_project_dir(req.project_id)
-    frames_dir = project_dir / "frames"
-    masks_dir = project_dir / "masks"
-    edited_dir = project_dir / "edited"
-    edited_dir.mkdir(exist_ok=True)
-
-    frame_files = sorted(frames_dir.glob("frame_*.jpg"))
-    mask_files = sorted(masks_dir.glob("mask_*.png"))
-
-    if len(frame_files) == 0:
+    if not any((project_dir / "frames").glob("frame_*.jpg")):
         return {"error": "No frames found. Run /extract first."}
 
-    # Upload all frames to Cloudinary
-    frame_ids = {}
-    for f in frame_files:
-        result = cloudinary_service.upload_file(str(f), folder=f"frameshift/{req.project_id}/frames")
-        frame_ids[f.name] = result["public_id"]
-
-    # Upload masks if they exist
-    mask_ids = {}
-    for m in mask_files:
-        result = cloudinary_service.upload_file(str(m), folder=f"frameshift/{req.project_id}/masks")
-        mask_ids[m.name] = result["public_id"]
-
-    # Get mask bbox for positioning
-    bbox_x, bbox_y, bbox_w, bbox_h = 0, 0, 0, 0
-    if mask_files:
-        from PIL import Image
-        import numpy as np
-        anchor_mask = np.array(Image.open(mask_files[0]))
-        rows = np.any(anchor_mask > 0, axis=1)
-        cols = np.any(anchor_mask > 0, axis=0)
-        if rows.any() and cols.any():
-            y_min, y_max = np.where(rows)[0][[0, -1]]
-            x_min, x_max = np.where(cols)[0][[0, -1]]
-            bbox_x, bbox_y = int(x_min), int(y_min)
-            bbox_w, bbox_h = int(x_max - x_min), int(y_max - y_min)
-
-    frame_list = sorted(frame_ids.keys())
-    mask_list = sorted(mask_ids.keys())
-    total_frames = len(frame_list)
-
-    # Determine which frames need edits
-    frames_to_edit = set()
-    for rule in req.edit_rules:
-        for i in range(rule.start_frame, min(rule.end_frame + 1, total_frames + 1)):
-            frames_to_edit.add(i)
-
-    async def process_frame(index):
-        frame_name = frame_list[index - 1]
-        f_id = frame_ids[frame_name]
-        m_id = mask_ids.get(mask_list[index - 1], "") if index - 1 < len(mask_list) else ""
-
-        if index not in frames_to_edit:
-            src = frames_dir / frame_name
-            dst = edited_dir / f"frame_{index:04d}.jpg"
-            shutil.copy2(str(src), str(dst))
-            return
-
-        # Apply first matching rule for this frame
-        url = None
-        for rule in req.edit_rules:
-            if rule.start_frame <= index <= rule.end_frame:
-                if rule.edit_type == "recolor" and m_id:
-                    url = await cloudinary_service.apply_recolor(f_id, m_id, rule.color)
-                elif rule.edit_type == "resize" and m_id:
-                    url = await cloudinary_service.apply_resize(f_id, m_id, bbox_x, bbox_y, bbox_w, bbox_h, rule.scale)
-                elif rule.edit_type == "replace" and m_id:
-                    url = await cloudinary_service.apply_replace(f_id, m_id, bbox_x, bbox_y, bbox_w, bbox_h)
-                elif rule.edit_type == "delete" and m_id:
-                    url = await cloudinary_service.apply_delete(f_id, m_id)
-                elif rule.edit_type == "add":
-                    url = await cloudinary_service.apply_add(
-                        f_id, rule.prompt,
-                        rule.asset_x or bbox_x, rule.asset_y or bbox_y,
-                        rule.asset_w or bbox_w, rule.asset_h or bbox_h,
-                    )
-                break
-
-        save_path = edited_dir / f"frame_{index:04d}.jpg"
-        if url:
-            await cloudinary_service.download_url(url, save_path)
-        else:
-            shutil.copy2(str(frames_dir / frame_name), str(save_path))
-
-    # Process in batches of 20 concurrent
-    batch_size = 20
-    for i in range(0, total_frames, batch_size):
-        batch = [process_frame(j + 1) for j in range(i, min(i + batch_size, total_frames))]
-        await asyncio.gather(*batch)
-
-    return {
-        "project_id": req.project_id,
-        "edited_frame_count": total_frames,
-        "edited_in_range": len(frames_to_edit),
-        "status": "done",
-    }
+    project_manager.update_status(
+        req.project_id,
+        edit_status="uploading",
+        edit_progress={"done": 0, "total": 0},
+    )
+    background_tasks.add_task(_background_edit, req.project_id, req.edit_rules)
+    return {"project_id": req.project_id, "edit_status": "uploading"}
 
 
 # --- Render ---
@@ -279,6 +304,10 @@ async def render_video(req: RenderRequest):
     project_dir = project_manager.get_project_dir(req.project_id)
     edited_dir = project_dir / "edited"
     output_path = project_dir / "output.mp4"
+
+    status = project_manager.get_status(req.project_id)
+    if status.get("edit_status") not in ("done", None, "idle"):
+        return {"error": f"Edit not complete. Current edit_status: {status.get('edit_status')}"}
 
     edited_frames = sorted(edited_dir.glob("frame_*.jpg"))
     if len(edited_frames) == 0:

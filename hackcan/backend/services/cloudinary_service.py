@@ -36,11 +36,11 @@ from pathlib import Path
 
 
 async def apply_recolor(frame_public_id: str, mask_public_id: str, color: str) -> str:
-    """Apply color overlay using mask. Returns transformed image URL."""
+    """Colorize the masked region. Opens mask as overlay layer, colorizes it, applies."""
     url = cloudinary.CloudinaryImage(frame_public_id).build_url(
         transformation=[
-            {"overlay": mask_public_id.replace("/", ":"), "effect": "colorize:80",
-             "color": f"#{color}", "flags": "layer_apply"},
+            {"overlay": mask_public_id.replace("/", ":"), "effect": f"colorize:80", "color": f"#{color}"},
+            {"flags": "layer_apply", "blend_mode": "multiply"},
         ],
         secure=True,
     )
@@ -81,11 +81,10 @@ async def apply_resize(frame_public_id: str, mask_public_id: str,
 
 
 async def apply_delete(frame_public_id: str, mask_public_id: str) -> str:
-    """Remove masked object using Cloudinary generative AI."""
+    """Remove masked object using Cloudinary generative AI (gen_remove)."""
     url = cloudinary.CloudinaryImage(frame_public_id).build_url(
         transformation=[
-            {"overlay": mask_public_id.replace("/", ":"), "flags": "layer_apply"},
-            {"effect": "gen_remove", "prompt": "remove the masked object"},
+            {"effect": "gen_remove"},
         ],
         secure=True,
     )
@@ -93,11 +92,11 @@ async def apply_delete(frame_public_id: str, mask_public_id: str) -> str:
 
 
 async def apply_add(frame_public_id: str, prompt: str, x: int, y: int, w: int, h: int) -> str:
-    """Generate object from prompt and overlay at position."""
+    """Generate object from prompt using gen_replace. Replaces background region with prompt object."""
+    safe_prompt = prompt.replace(" ", "_").replace(";", "").replace("/", "")
     url = cloudinary.CloudinaryImage(frame_public_id).build_url(
         transformation=[
-            {"effect": f"gen_replace:from_natural;to_{prompt}",
-             "x": x, "y": y, "width": w, "height": h, "crop": "fill"},
+            {"effect": f"gen_replace:from_background;to_{safe_prompt}"},
         ],
         secure=True,
     )

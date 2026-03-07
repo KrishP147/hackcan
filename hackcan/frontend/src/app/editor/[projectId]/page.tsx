@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { useParams } from "next/navigation";
 import { Stage, Layer, Rect, Image as KonvaImage } from "react-konva";
 import { ArrowLeft, Loader2 } from "lucide-react";
@@ -20,6 +20,9 @@ export default function EditorPage() {
   const [currentFrame, setCurrentFrame] = useState(1);
   const [frameImage, setFrameImage] = useState<HTMLImageElement | null>(null);
   const [detections, setDetections] = useState<Detection[]>([]);
+  const [allDetections, setAllDetections] = useState<Record<string, Detection[]>>({});
+  const [projectReady, setProjectReady] = useState(false);
+  const [loadingStatus, setLoadingStatus] = useState("Waiting for frames...");
   const [maskVisible, setMaskVisible] = useState(false);
   const [editType, setEditType] = useState("recolor");
   const [editColor, setEditColor] = useState("#FF0000");
@@ -28,49 +31,75 @@ export default function EditorPage() {
   const [resultUrl, setResultUrl] = useState("");
   const [canvasSize, setCanvasSize] = useState({ width: 960, height: 540 });
   const [imageSize, setImageSize] = useState({ width: 960, height: 540 });
+  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Fix #3: accept detectionsMap as param to avoid stale closure; no /detect call
   const loadFrame = useCallback(
-    async (index: number) => {
+    (index: number, detectionsMap: Record<string, Detection[]>) => {
       const img = new window.Image();
       img.crossOrigin = "anonymous";
       img.src = `${API_URL}/frame/${projectId}/${index}`;
       img.onload = () => {
         const scale = Math.min(960 / img.width, 540 / img.height);
-        setCanvasSize({
-          width: img.width * scale,
-          height: img.height * scale,
-        });
+        setCanvasSize({ width: img.width * scale, height: img.height * scale });
         setImageSize({ width: img.width, height: img.height });
         setFrameImage(img);
       };
       setCurrentFrame(index);
-
-      const res = await fetch(`${API_URL}/detect`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project_id: projectId, frame_index: index }),
-      });
-      const data = await res.json();
-      setDetections(data.objects || []);
+      setDetections(detectionsMap[String(index)] || []);
     },
     [projectId]
   );
 
+  // Fix #2: poll until status === "ready", then load cached detections
   useEffect(() => {
-    fetch(`${API_URL}/project/${projectId}/status`)
-      .then((r) => r.json())
-      .then((d) => { if (d.frame_count > 0) setFrameCount(d.frame_count); })
-      .catch(() => {});
-    loadFrame(1);
-  }, [loadFrame, projectId]);
+    let cancelled = false;
+
+    const statusLabels: Record<string, string> = {
+      created: "Project created...",
+      processing: "Processing...",
+      extracting: "Extracting frames...",
+      detecting: "Running object detection...",
+      ready: "Ready",
+    };
+
+    const poll = async () => {
+      try {
+        const res = await fetch(`${API_URL}/project/${projectId}/status`);
+        const data = await res.json();
+        if (cancelled) return;
+
+        setLoadingStatus(statusLabels[data.status] ?? data.status);
+
+        if (data.status === "ready") {
+          const count = data.frame_count > 0 ? data.frame_count : 300;
+          const dets: Record<string, Detection[]> = data.detections || {};
+          setFrameCount(count);
+          setAllDetections(dets);
+          setProjectReady(true);
+          loadFrame(1, dets);
+          return;
+        }
+      } catch {
+        // keep polling on network errors
+      }
+      if (!cancelled) {
+        pollRef.current = setTimeout(poll, 2000);
+      }
+    };
+
+    poll();
+    return () => {
+      cancelled = true;
+      if (pollRef.current) clearTimeout(pollRef.current);
+    };
+  }, [projectId, loadFrame]);
 
   async function handleCanvasClick(e: any) {
     const stage = e.target.getStage();
     const pos = stage.getPointerPosition();
     const scaleX = imageSize.width / canvasSize.width;
     const scaleY = imageSize.height / canvasSize.height;
-    const clickX = Math.round(pos.x * scaleX);
-    const clickY = Math.round(pos.y * scaleY);
 
     setProcessing("Segmenting object...");
     const res = await fetch(`${API_URL}/segment`, {
@@ -79,8 +108,8 @@ export default function EditorPage() {
       body: JSON.stringify({
         project_id: projectId,
         frame_index: currentFrame,
-        click_x: clickX,
-        click_y: clickY,
+        click_x: Math.round(pos.x * scaleX),
+        click_y: Math.round(pos.y * scaleY),
       }),
     });
     const data = await res.json();
@@ -88,20 +117,22 @@ export default function EditorPage() {
     setProcessing(`Segmented! ${data.mask_count} masks generated.`);
   }
 
+  // Fix #1: wrap in edit_rules array with start_frame / end_frame
   async function handleApplyEdit() {
     setProcessing(`Applying ${editType} edit to all frames...`);
 
-    const editParams: Record<string, unknown> = {
-      project_id: projectId,
+    const rule: Record<string, unknown> = {
       edit_type: editType,
+      start_frame: 1,
+      end_frame: frameCount,
     };
-    if (editType === "recolor") editParams.color = editColor.replace("#", "");
-    if (editType === "resize") editParams.scale = editScale;
+    if (editType === "recolor") rule.color = editColor.replace("#", "");
+    if (editType === "resize") rule.scale = editScale;
 
     await fetch(`${API_URL}/edit`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(editParams),
+      body: JSON.stringify({ project_id: projectId, edit_rules: [rule] }),
     });
 
     setProcessing("Rendering final video...");
@@ -120,7 +151,6 @@ export default function EditorPage() {
 
   return (
     <div className="flex min-h-screen flex-col bg-black text-white">
-      {/* Header */}
       <header className="flex items-center gap-4 border-b border-white/10 px-8 py-4">
         <Link
           href="/"
@@ -134,40 +164,47 @@ export default function EditorPage() {
       </header>
 
       <main className="flex flex-1 gap-6 p-6">
-        {/* Canvas + scrubber */}
         <div className="flex-1 min-w-0">
-          <div className="inline-block overflow-hidden rounded-xl border border-white/10">
-            <Stage
-              width={canvasSize.width}
-              height={canvasSize.height}
-              onClick={handleCanvasClick}
-              style={{ cursor: "crosshair" }}
-            >
-              <Layer>
-                {frameImage && (
-                  <KonvaImage
-                    image={frameImage}
-                    width={canvasSize.width}
-                    height={canvasSize.height}
-                  />
-                )}
-                {detections.map((det, i) => (
-                  <Rect
-                    key={i}
-                    x={det.bbox[0] * scaleX}
-                    y={det.bbox[1] * scaleY}
-                    width={(det.bbox[2] - det.bbox[0]) * scaleX}
-                    height={(det.bbox[3] - det.bbox[1]) * scaleY}
-                    stroke="#f43f5e"
-                    strokeWidth={2}
-                    cornerRadius={2}
-                  />
-                ))}
-              </Layer>
-            </Stage>
-          </div>
+          {!projectReady ? (
+            <div className="flex h-[540px] items-center justify-center rounded-xl border border-white/10">
+              <div className="flex flex-col items-center gap-3 text-white/40">
+                <Loader2 className="h-8 w-8 animate-spin" />
+                <span className="text-sm">{loadingStatus}</span>
+              </div>
+            </div>
+          ) : (
+            <div className="inline-block overflow-hidden rounded-xl border border-white/10">
+              <Stage
+                width={canvasSize.width}
+                height={canvasSize.height}
+                onClick={handleCanvasClick}
+                style={{ cursor: "crosshair" }}
+              >
+                <Layer>
+                  {frameImage && (
+                    <KonvaImage
+                      image={frameImage}
+                      width={canvasSize.width}
+                      height={canvasSize.height}
+                    />
+                  )}
+                  {detections.map((det, i) => (
+                    <Rect
+                      key={i}
+                      x={det.bbox[0] * scaleX}
+                      y={det.bbox[1] * scaleY}
+                      width={(det.bbox[2] - det.bbox[0]) * scaleX}
+                      height={(det.bbox[3] - det.bbox[1]) * scaleY}
+                      stroke="#f43f5e"
+                      strokeWidth={2}
+                      cornerRadius={2}
+                    />
+                  ))}
+                </Layer>
+              </Stage>
+            </div>
+          )}
 
-          {/* Frame scrubber */}
           <div className="mt-4 flex items-center gap-4">
             <span className="w-24 font-mono text-sm text-white/40">
               Frame {currentFrame}
@@ -177,8 +214,9 @@ export default function EditorPage() {
               min={1}
               max={frameCount}
               value={currentFrame}
-              onChange={(e) => loadFrame(Number(e.target.value))}
-              className="flex-1 accent-white"
+              onChange={(e) => loadFrame(Number(e.target.value), allDetections)}
+              disabled={!projectReady}
+              className="flex-1 accent-white disabled:opacity-30"
             />
             <span className="w-8 font-mono text-sm text-white/40">
               {frameCount}
@@ -186,14 +224,12 @@ export default function EditorPage() {
           </div>
         </div>
 
-        {/* Edit panel */}
         <div className="w-72 shrink-0 space-y-5">
           <h2 className="text-base font-semibold">Edit Object</h2>
           <p className="text-xs text-white/40">
             Click an object on the canvas to segment it, then apply an edit.
           </p>
 
-          {/* Edit type */}
           <div className="space-y-1.5">
             <label className="block text-xs text-white/40">Edit Type</label>
             <select
@@ -207,7 +243,6 @@ export default function EditorPage() {
             </select>
           </div>
 
-          {/* Recolor controls */}
           {editType === "recolor" && (
             <div className="space-y-1.5">
               <label className="block text-xs text-white/40">Target Color</label>
@@ -220,12 +255,9 @@ export default function EditorPage() {
             </div>
           )}
 
-          {/* Resize controls */}
           {editType === "resize" && (
             <div className="space-y-1.5">
-              <label className="block text-xs text-white/40">
-                Scale: {editScale}x
-              </label>
+              <label className="block text-xs text-white/40">Scale: {editScale}x</label>
               <input
                 type="range"
                 min={0.5}
@@ -238,16 +270,14 @@ export default function EditorPage() {
             </div>
           )}
 
-          {/* Apply button */}
           <button
             onClick={handleApplyEdit}
-            disabled={!maskVisible}
+            disabled={!maskVisible || !projectReady}
             className="w-full rounded-full bg-white px-4 py-3 text-sm font-medium text-black transition-opacity hover:opacity-80 disabled:cursor-not-allowed disabled:opacity-20"
           >
             Apply Edit
           </button>
 
-          {/* Status */}
           {processing && (
             <div className="flex items-center gap-2 text-sm text-white/40">
               {processing !== "Done!" && (
@@ -257,7 +287,6 @@ export default function EditorPage() {
             </div>
           )}
 
-          {/* Result video */}
           {resultUrl && (
             <div className="space-y-2">
               <h3 className="text-sm font-semibold">Result</h3>

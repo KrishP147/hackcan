@@ -12,7 +12,13 @@ def create_project() -> dict:
     (project_dir / "masks").mkdir(exist_ok=True)
     (project_dir / "edited").mkdir(exist_ok=True)
 
-    _write_status(project_id, {"status": "created", "frame_count": 0, "detections": {}})
+    _write_status(project_id, {
+        "status": "created",
+        "frame_count": 0,
+        "detections": {},
+        "edit_status": "idle",
+        "edit_progress": {"done": 0, "total": 0},
+    })
 
     return {"project_id": project_id, "project_dir": str(project_dir)}
 
