@@ -211,9 +211,72 @@ class EditRequest(BaseModel):
     project_id: str
     edit_rules: List[EditRule]
 
+def _composite_with_mask(original_path, edited_path, mask_array):
+    """Blend edited image onto original using SAM2 mask: edited where mask=white, original elsewhere."""
+    from PIL import Image
+    original = np.array(Image.open(original_path).convert("RGB"))
+    edited = np.array(Image.open(edited_path).convert("RGB"))
+
+    # Resize mask to match frame dimensions if needed
+    mask = mask_array
+    if mask.shape[:2] != original.shape[:2]:
+        mask_img = Image.fromarray(mask).resize((original.shape[1], original.shape[0]), Image.NEAREST)
+        mask = np.array(mask_img)
+
+    # Normalize mask to 0-1 float, expand to 3 channels
+    if mask.ndim == 3:
+        mask = mask[:, :, 0]
+    alpha = (mask > 0).astype(np.float32)[:, :, np.newaxis]
+
+    # Resize edited to match original if Cloudinary changed dimensions
+    if edited.shape[:2] != original.shape[:2]:
+        edited_img = Image.fromarray(edited).resize((original.shape[1], original.shape[0]), Image.LANCZOS)
+        edited = np.array(edited_img)
+
+    result = (alpha * edited + (1 - alpha) * original).astype(np.uint8)
+    Image.fromarray(result).save(str(edited_path), quality=95)
+
+
+def _apply_recolor_local(frame_path, mask_array, color_hex: str):
+    """Apply color tint locally using SAM2 mask — no Cloudinary needed."""
+    from PIL import Image
+    original = np.array(Image.open(frame_path).convert("RGB"))
+
+    mask = mask_array
+    if mask.shape[:2] != original.shape[:2]:
+        mask_img = Image.fromarray(mask).resize((original.shape[1], original.shape[0]), Image.NEAREST)
+        mask = np.array(mask_img)
+    if mask.ndim == 3:
+        mask = mask[:, :, 0]
+    alpha = (mask > 0).astype(np.float32)[:, :, np.newaxis]
+
+    # Parse hex color
+    color_hex = color_hex.lstrip("#")
+    r, g, b = int(color_hex[0:2], 16), int(color_hex[2:4], 16), int(color_hex[4:6], 16)
+    tint = np.full_like(original, [r, g, b])
+
+    # Blend: 60% original + 40% tint in masked region
+    tinted = (0.6 * original + 0.4 * tint).clip(0, 255).astype(np.uint8)
+    result = (alpha * tinted + (1 - alpha) * original).astype(np.uint8)
+
+    save_path = frame_path
+    Image.fromarray(result).save(str(save_path), quality=95)
+    return save_path
+
+
+# Edits that should be masked locally (applied to full frame by Cloudinary, then composited)
+MASK_EDITS = {"delete", "replace", "resize", "blur_region", "gen_recolor"}
+# Edits done entirely locally with mask
+LOCAL_EDITS = {"recolor"}
+# Edits that affect the whole frame (no masking)
+FRAME_EDITS = {"bg_remove", "bg_replace", "gen_fill", "enhance", "upscale", "restore", "blur", "drop_shadow"}
+
+
 async def _background_edit(project_id: str, edit_rules: List[EditRule]):
     """Background task: upload only the needed frames, apply edits, download results."""
     try:
+        from PIL import Image
+
         project_dir = project_manager.get_project_dir(project_id)
         frames_dir = project_dir / "frames"
         masks_dir = project_dir / "masks"
@@ -227,90 +290,98 @@ async def _background_edit(project_id: str, edit_rules: List[EditRule]):
         total = len(frames_to_edit)
         project_manager.update_status(project_id, edit_status="uploading", edit_progress={"done": 0, "total": total})
 
-        # Upload only the frames we need
-        frame_ids: dict[int, str] = {}
-        for idx in sorted(frames_to_edit):
-            frame_path = frames_dir / f"frame_{idx:04d}.jpg"
-            if not frame_path.exists():
-                continue
-            result = cloudinary_service.upload_file(str(frame_path), folder=f"frameshift/{project_id}/frames")
-            frame_ids[idx] = result["public_id"]
-
-        # Upload mask for the first frame if it exists (SAM 2 produces one mask per segment)
-        mask_id = ""
+        # Load SAM2 mask if available
+        mask_array = None
         mask_files = sorted(masks_dir.glob("mask_*.png"))
         bbox_x, bbox_y, bbox_w, bbox_h = 0, 0, 0, 0
         if mask_files:
-            result = cloudinary_service.upload_file(str(mask_files[0]), folder=f"frameshift/{project_id}/masks")
-            mask_id = result["public_id"]
-            from PIL import Image
-            anchor_mask = np.array(Image.open(mask_files[0]))
-            rows = np.any(anchor_mask > 0, axis=1)
-            cols = np.any(anchor_mask > 0, axis=0)
+            mask_array = np.array(Image.open(mask_files[0]))
+            rows = np.any(mask_array > 0, axis=1)
+            cols = np.any(mask_array > 0, axis=0)
             if rows.any() and cols.any():
                 y_min, y_max = np.where(rows)[0][[0, -1]]
                 x_min, x_max = np.where(cols)[0][[0, -1]]
                 bbox_x, bbox_y = int(x_min), int(y_min)
                 bbox_w, bbox_h = int(x_max - x_min), int(y_max - y_min)
 
+        # Check if any rule needs Cloudinary (not purely local)
+        needs_cloudinary = any(r.edit_type not in LOCAL_EDITS for r in edit_rules)
+
+        # Upload frames to Cloudinary only if needed
+        frame_ids: dict[int, str] = {}
+        if needs_cloudinary:
+            for idx in sorted(frames_to_edit):
+                frame_path = frames_dir / f"frame_{idx:04d}.jpg"
+                if not frame_path.exists():
+                    continue
+                result = cloudinary_service.upload_file(str(frame_path), folder=f"frameshift/{project_id}/frames")
+                frame_ids[idx] = result["public_id"]
+
         project_manager.update_status(project_id, edit_status="editing")
         completed = 0
 
         for idx in sorted(frames_to_edit):
-            f_id = frame_ids.get(idx)
-            if not f_id:
+            frame_path = frames_dir / f"frame_{idx:04d}.jpg"
+            if not frame_path.exists():
                 completed += 1
                 continue
 
-            url = None
+            f_id = frame_ids.get(idx, "")
+
             for rule in edit_rules:
                 if rule.start_frame <= idx <= rule.end_frame:
                     t = rule.edit_type
 
-                    # ── Core edits (use SAM 2 mask) ──
-                    if t == "recolor" and mask_id:
-                        url = await cloudinary_service.apply_recolor(f_id, mask_id, rule.color, rule.prompt)
-                    elif t == "resize" and mask_id:
-                        url = await cloudinary_service.apply_resize(f_id, mask_id, bbox_x, bbox_y, bbox_w, bbox_h, rule.scale)
-                    elif t == "replace" and mask_id:
-                        url = await cloudinary_service.apply_replace(f_id, mask_id, rule.prompt or "object")
-                    elif t == "delete" and mask_id:
-                        url = await cloudinary_service.apply_delete(f_id, mask_id)
-                    elif t == "add":
-                        url = await cloudinary_service.apply_add(
-                            f_id, rule.prompt or "object",
-                            rule.asset_x or bbox_x, rule.asset_y or bbox_y,
-                            rule.asset_w or bbox_w, rule.asset_h or bbox_h,
-                        )
-                    elif t == "blur_region" and mask_id:
-                        url = await cloudinary_service.apply_blur_region(f_id, mask_id)
+                    # ── Local-only edits (use mask directly with PIL) ──
+                    if t == "recolor" and mask_array is not None:
+                        _apply_recolor_local(frame_path, mask_array, rule.color or "FF0000")
+
+                    # ── Cloudinary edits that need local mask compositing ──
+                    elif t in MASK_EDITS and f_id:
+                        url = None
+                        if t == "delete":
+                            url = await cloudinary_service.apply_delete(f_id, "")
+                        elif t == "replace":
+                            url = await cloudinary_service.apply_replace(f_id, "", rule.prompt or "object")
+                        elif t == "resize":
+                            url = await cloudinary_service.apply_resize(f_id, "", bbox_x, bbox_y, bbox_w, bbox_h, rule.scale or 1.5)
+                        elif t == "blur_region":
+                            # Apply blur to full frame, then composite
+                            url = await cloudinary_service.apply_blur(f_id, 1000)
+                        elif t == "gen_recolor":
+                            url = await cloudinary_service.apply_generative_recolor(f_id, rule.prompt or "object", rule.color or "FF0000")
+
+                        if url and mask_array is not None:
+                            tmp_path = frame_path.with_suffix(".edited.jpg")
+                            await cloudinary_service.download_url(url, tmp_path)
+                            _composite_with_mask(frame_path, tmp_path, mask_array)
+                            # Move composited result to original location
+                            shutil.move(str(tmp_path), str(frame_path))
 
                     # ── Whole-frame edits (no mask needed) ──
-                    elif t == "bg_remove":
-                        url = await cloudinary_service.apply_background_remove(f_id)
-                    elif t == "bg_replace":
-                        url = await cloudinary_service.apply_background_replace(f_id, rule.prompt or "studio background")
-                    elif t == "gen_fill":
-                        url = await cloudinary_service.apply_generative_fill(f_id, rule.prompt)
-                    elif t == "enhance":
-                        url = await cloudinary_service.apply_enhance(f_id)
-                    elif t == "upscale":
-                        url = await cloudinary_service.apply_upscale(f_id)
-                    elif t == "restore":
-                        url = await cloudinary_service.apply_restore(f_id)
-                    elif t == "blur":
-                        url = await cloudinary_service.apply_blur(f_id, rule.blur_strength or 500)
-                    elif t == "drop_shadow":
-                        url = await cloudinary_service.apply_drop_shadow(f_id)
-                    elif t == "gen_recolor":
-                        url = await cloudinary_service.apply_generative_recolor(f_id, rule.prompt or "object", rule.color or "FF0000")
+                    elif t in FRAME_EDITS and f_id:
+                        url = None
+                        if t == "bg_remove":
+                            url = await cloudinary_service.apply_background_remove(f_id)
+                        elif t == "bg_replace":
+                            url = await cloudinary_service.apply_background_replace(f_id, rule.prompt or "studio background")
+                        elif t == "gen_fill":
+                            url = await cloudinary_service.apply_generative_fill(f_id, rule.prompt)
+                        elif t == "enhance":
+                            url = await cloudinary_service.apply_enhance(f_id)
+                        elif t == "upscale":
+                            url = await cloudinary_service.apply_upscale(f_id)
+                        elif t == "restore":
+                            url = await cloudinary_service.apply_restore(f_id)
+                        elif t == "blur":
+                            url = await cloudinary_service.apply_blur(f_id, rule.blur_strength or 500)
+                        elif t == "drop_shadow":
+                            url = await cloudinary_service.apply_drop_shadow(f_id)
+
+                        if url:
+                            await cloudinary_service.download_url(url, frame_path)
 
                     break
-
-            # Download the edited frame back, overwriting the original
-            if url:
-                save_path = frames_dir / f"frame_{idx:04d}.jpg"
-                await cloudinary_service.download_url(url, save_path)
 
             completed += 1
             project_manager.update_status(project_id, edit_progress={"done": completed, "total": total})

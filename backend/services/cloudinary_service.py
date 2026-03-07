@@ -42,32 +42,11 @@ def _safe(text: str) -> str:
 
 # ── Core edit types (use SAM 2 mask) ──────────────────────────────────
 
-async def apply_recolor(frame_public_id: str, mask_public_id: str, color: str, prompt: str = None) -> str:
-    """Recolor masked region using generative recolor when prompt is given, else overlay tint."""
-    if prompt:
-        url = cloudinary.CloudinaryImage(frame_public_id).build_url(
-            transformation=[
-                {"effect": f"gen_recolor:prompt_{_safe(prompt)};to-color_{color}"},
-            ],
-            secure=True,
-        )
-    else:
-        url = cloudinary.CloudinaryImage(frame_public_id).build_url(
-            transformation=[
-                {"overlay": mask_public_id.replace("/", ":"), "effect": "colorize:80", "color": f"#{color}"},
-                {"flags": "layer_apply", "blend_mode": "multiply"},
-            ],
-            secure=True,
-        )
-    return url
-
-
 async def apply_replace(frame_public_id: str, mask_public_id: str, prompt: str) -> str:
-    """Replace masked object with AI-generated content from a text prompt."""
+    """Replace object with AI-generated content. Masking done locally."""
     url = cloudinary.CloudinaryImage(frame_public_id).build_url(
         transformation=[
-            {"overlay": mask_public_id.replace("/", ":"), "flags": "layer_apply"},
-            {"effect": f"gen_replace:from_masked_region;to_{_safe(prompt)}"},
+            {"effect": f"gen_replace:from_auto;to_{_safe(prompt)}"},
         ],
         secure=True,
     )
@@ -76,7 +55,7 @@ async def apply_replace(frame_public_id: str, mask_public_id: str, prompt: str) 
 
 async def apply_resize(frame_public_id: str, mask_public_id: str,
                         x: int, y: int, w: int, h: int, scale: float) -> str:
-    """Crop the object region, scale it, fill the gap, and overlay the scaled object."""
+    """Crop the object region and scale it."""
     new_w = int(w * scale)
     new_h = int(h * scale)
     offset_x = x - (new_w - w) // 2
@@ -84,10 +63,6 @@ async def apply_resize(frame_public_id: str, mask_public_id: str,
 
     url = cloudinary.CloudinaryImage(frame_public_id).build_url(
         transformation=[
-            # First remove the object to get a clean background
-            {"overlay": mask_public_id.replace("/", ":"), "flags": "layer_apply"},
-            {"effect": "gen_remove"},
-            # Then overlay the original object region at new size
             {"overlay": frame_public_id.replace("/", ":"),
              "crop": "crop", "x": x, "y": y, "width": w, "height": h},
             {"width": new_w, "height": new_h, "crop": "scale"},
@@ -99,10 +74,9 @@ async def apply_resize(frame_public_id: str, mask_public_id: str,
 
 
 async def apply_delete(frame_public_id: str, mask_public_id: str) -> str:
-    """Remove masked object using gen_remove with mask overlay to target the exact region."""
+    """Remove object using gen_remove. Masking done locally after download."""
     url = cloudinary.CloudinaryImage(frame_public_id).build_url(
         transformation=[
-            {"overlay": mask_public_id.replace("/", ":"), "flags": "layer_apply"},
             {"effect": "gen_remove"},
         ],
         secure=True,

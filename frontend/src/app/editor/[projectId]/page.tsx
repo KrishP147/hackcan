@@ -6,7 +6,7 @@ import { EditorTimeline } from "@/components/editor/EditorTimeline";
 import { EditToolbar } from "@/components/editor/EditToolbar";
 import { Toast } from "@/components/editor/Toast";
 import { useEditorState } from "@/hooks/useEditorState";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 
 export default function EditorPage() {
@@ -14,6 +14,7 @@ export default function EditorPage() {
   const projectId = params.projectId as string;
   const editor = useEditorState(projectId);
   const playIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [isDark, setIsDark] = useState(false);
 
   // Playback loop
   useEffect(() => {
@@ -58,11 +59,16 @@ export default function EditorPage() {
   }, [editor]);
 
   return (
-    <div className="h-screen flex flex-col bg-[#0a0a0a] overflow-hidden select-none">
+    <div
+      className={`h-screen flex flex-col overflow-hidden select-none transition-colors duration-300 ${isDark ? "editor-dark" : "editor-light"}`}
+      style={{ background: "var(--ed-bg)" }}
+    >
       <EditorTopBar
         videoName={editor.videoName}
         onNameChange={editor.setVideoName}
         videoLoaded={editor.videoLoaded}
+        isDark={isDark}
+        onToggleTheme={() => setIsDark((d) => !d)}
       />
 
       <div className="flex-1 flex overflow-hidden">
@@ -111,9 +117,12 @@ export default function EditorPage() {
         isPlaying={editor.isPlaying}
         isProcessing={editor.isProcessing}
         zoom={editor.zoom}
+        editRangeStart={editor.editRangeStart}
+        editRangeEnd={editor.editRangeEnd}
         onFrameChange={editor.setCurrentFrame}
         onTogglePlay={editor.togglePlay}
         onZoomChange={editor.setZoom}
+        onEditRangeChange={editor.setEditRange}
       />
 
       <Toast

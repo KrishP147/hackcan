@@ -38,6 +38,8 @@ interface EditorState {
   editParams: EditParams;
   isProcessing: boolean;
   applyToAllFrames: boolean;
+  editRangeStart: number;
+  editRangeEnd: number;
   zoom: number;
   showEditPanel: boolean;
   toastMessage: string;
@@ -74,6 +76,8 @@ export function useEditorState(projectId?: string) {
     editParams: DEFAULT_EDIT_PARAMS,
     isProcessing: false,
     applyToAllFrames: true,
+    editRangeStart: 0,
+    editRangeEnd: 0,
     zoom: 100,
     showEditPanel: false,
     toastMessage: "",
@@ -116,6 +120,7 @@ export function useEditorState(projectId?: string) {
               frames: generateFrames(frameCount),
               frameWidth: status.frame_width || 0,
               frameHeight: status.frame_height || 0,
+              editRangeEnd: s.editRangeEnd === 0 ? frameCount - 1 : s.editRangeEnd,
               isDetecting: !!status.detecting,
               isSegmenting: !!status.segmenting,
               maskCount: status.mask_count || 0,
@@ -310,10 +315,13 @@ export function useEditorState(projectId?: string) {
       setState((s) => {
         if (!s.projectId) return s;
 
+        // Use edit range, falling back to full video if range hasn't been set
+        const startFrame = s.editRangeStart + 1;  // 1-based for backend
+        const endFrame = s.editRangeEnd > 0 ? s.editRangeEnd + 1 : s.frames.length;
         const editRule: Record<string, unknown> = {
           edit_type: action,
-          start_frame: s.currentFrame + 1,
-          end_frame: s.currentFrame + 1,
+          start_frame: startFrame,
+          end_frame: endFrame,
         };
         if (params.color) editRule.color = params.color;
         if (params.prompt) editRule.prompt = params.prompt;
@@ -378,6 +386,10 @@ export function useEditorState(projectId?: string) {
     setState((s) => ({ ...s, applyToAllFrames: value }));
   }, []);
 
+  const setEditRange = useCallback((start: number, end: number) => {
+    setState((s) => ({ ...s, editRangeStart: start, editRangeEnd: end }));
+  }, []);
+
   const closeEditPanel = useCallback(() => {
     setState((s) => ({
       ...s,
@@ -415,6 +427,7 @@ export function useEditorState(projectId?: string) {
     togglePlay,
     setZoom,
     setApplyToAllFrames,
+    setEditRange,
     closeEditPanel,
     setVideoName,
     hideToast,

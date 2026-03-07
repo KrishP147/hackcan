@@ -1,3 +1,14 @@
+# =============================================================
+# EXTERNAL DEPENDENCIES (not installed by pip):
+#
+# 1. FFmpeg — install via: winget install FFmpeg (Windows)
+#                          brew install ffmpeg   (macOS)
+#
+# 2. SAM 2 checkpoint — download to backend/checkpoints/:
+#    mkdir checkpoints
+#    curl -L -o checkpoints/sam2_hiera_tiny.pt https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_tiny.pt
+# =============================================================
+
 # Web framework
 fastapi==0.115.6
 uvicorn[standard]==0.34.0

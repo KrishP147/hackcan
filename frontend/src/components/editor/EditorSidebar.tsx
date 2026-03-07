@@ -56,7 +56,10 @@ export function EditorSidebar({
   ];
 
   return (
-    <aside className="w-[72px] flex flex-col items-center py-4 gap-2 border-r border-[var(--border-dark)] bg-[#111827]">
+    <aside
+      className="w-[60px] flex flex-col items-center py-4 gap-1.5 border-r shrink-0"
+      style={{ background: "var(--ed-surface)", borderColor: "var(--ed-border)" }}
+    >
       {items.map((item) => {
         const Icon = item.icon;
         const isActive = activeId === item.id;
@@ -70,18 +73,34 @@ export function EditorSidebar({
             disabled={item.disabled}
             aria-label={item.label}
             title={item.label}
-            className={`relative flex items-center justify-center rounded-2xl transition-all duration-200 group
-              ${isActive ? "w-12 h-12 bg-[var(--accent)]/20 text-[var(--accent)]" : "w-10 h-10 text-white/40 hover:text-white/70 hover:bg-white/5"}
-              ${item.disabled ? "opacity-30 cursor-not-allowed" : "cursor-pointer"}
-            `}
+            className="relative w-10 h-10 flex items-center justify-center rounded-2xl transition-all duration-200 group"
+            style={{
+              background: isActive ? "rgba(244,63,94,0.12)" : "transparent",
+              color: isActive ? "var(--accent)" : "var(--ed-icon)",
+              opacity: item.disabled ? 0.25 : 1,
+              cursor: item.disabled ? "not-allowed" : "pointer",
+            }}
           >
             {item.loading ? (
-              <div className="w-5 h-5 border-2 border-[var(--accent)] border-t-transparent rounded-full animate-spin" />
+              <div
+                className="w-[18px] h-[18px] border-2 border-t-transparent rounded-full animate-spin"
+                style={{ borderColor: "var(--accent)", borderTopColor: "transparent" }}
+              />
             ) : (
-              <Icon className={`${isActive ? "w-5 h-5" : "w-[18px] h-[18px]"} transition-all duration-200`} strokeWidth={isActive ? 2.2 : 1.5} />
+              <Icon
+                className="w-[18px] h-[18px] transition-all duration-200"
+                strokeWidth={isActive ? 2.2 : 1.6}
+              />
             )}
             {/* Tooltip */}
-            <span className="absolute left-full ml-2 px-2 py-1 rounded-md bg-white text-[#171717] text-xs font-medium opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-50">
+            <span
+              className="absolute left-full ml-3 px-2 py-1 rounded-lg text-xs font-medium opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-50 shadow-xl border"
+              style={{
+                background: "var(--ed-surface)",
+                color: "var(--ed-text)",
+                borderColor: "var(--ed-border)",
+              }}
+            >
               {item.label}
             </span>
           </button>

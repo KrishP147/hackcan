@@ -13,7 +13,6 @@ import {
   ArrowUpCircle,
   WandSparkles,
   Droplets,
-  Plus,
   X,
 } from "lucide-react";
 
@@ -87,29 +86,39 @@ export function EditToolbar({ objectLabel, active, onApply, onClose }: EditToolb
 
   return (
     <div
-      className="w-[220px] shrink-0 bg-[#111827]/95 backdrop-blur-xl border-l border-white/10 flex flex-col overflow-y-auto"
+      className="w-[220px] shrink-0 flex flex-col overflow-y-auto border-l"
+      style={{ background: "var(--ed-surface)", borderColor: "var(--ed-border)" }}
       onClick={(e) => e.stopPropagation()}
     >
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-white/5">
+      <div
+        className="flex items-center justify-between px-4 py-3 border-b"
+        style={{ borderColor: "var(--ed-surface-2)" }}
+      >
         <div className="flex items-center gap-2">
-          <div className={`w-2 h-2 rounded-full transition-colors ${active ? "bg-[var(--accent)]" : "bg-white/20"}`} />
-          <span className={`text-sm font-medium transition-colors ${active ? "text-white/90" : "text-white/30"}`}>
-            {active ? objectLabel : "No selection"}
+          <div
+            className="w-1.5 h-1.5 rounded-full transition-colors"
+            style={{ background: active ? "var(--accent)" : "var(--ed-icon-dim)" }}
+          />
+          <span
+            className="text-sm font-medium transition-colors"
+            style={{ color: active ? "var(--ed-text)" : "var(--ed-subtle)" }}
+          >
+            {active ? objectLabel : "selection"}
           </span>
         </div>
-        {active && (
-          <button onClick={onClose} className="text-white/30 hover:text-white/70 transition-colors">
-            <X className="w-4 h-4" />
-          </button>
-        )}
+        {/* no close button */}
       </div>
 
-      {/* Option grid or param input */}
       {!selected ? (
-        <div className="p-3">
-          <p className={`text-[10px] uppercase tracking-wider font-medium mb-2 px-1 transition-colors ${active ? "text-white/30" : "text-white/15"}`}>Object</p>
-          <div className="grid grid-cols-3 gap-1.5 mb-3">
+        <div className="p-3 flex-1">
+          <p
+            className="text-[10px] uppercase tracking-widest font-semibold mb-2 px-1"
+            style={{ color: active ? "var(--ed-icon-dim)" : "var(--ed-disabled)" }}
+          >
+            Object
+          </p>
+          <div className="grid grid-cols-3 gap-1 mb-4">
             {objectEdits.map((opt) => {
               const Icon = opt.icon;
               return (
@@ -123,21 +132,28 @@ export function EditToolbar({ objectLabel, active, onApply, onClose }: EditToolb
                       setSelected(opt);
                     }
                   }}
-                  className={`flex flex-col items-center gap-1.5 py-2.5 px-1 rounded-xl transition-all group ${
-                    active
-                      ? "text-white/50 hover:text-white hover:bg-white/5 cursor-pointer"
-                      : "text-white/15 cursor-not-allowed"
-                  }`}
+                  className="flex flex-col items-center gap-1.5 py-2.5 px-1 rounded-xl transition-all"
+                  style={{
+                    color: active ? "var(--ed-icon)" : "var(--ed-disabled)",
+                    cursor: active ? "pointer" : "not-allowed",
+                  }}
+                  onMouseEnter={(e) => active && (e.currentTarget.style.background = "var(--ed-hover)")}
+                  onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
                 >
-                  <Icon className={`w-4 h-4 transition-colors ${active ? "group-hover:text-[var(--accent)]" : ""}`} />
+                  <Icon className="w-4 h-4" strokeWidth={1.5} />
                   <span className="text-[10px] font-medium">{opt.label}</span>
                 </button>
               );
             })}
           </div>
 
-          <p className={`text-[10px] uppercase tracking-wider font-medium mb-2 px-1 transition-colors ${active ? "text-white/30" : "text-white/15"}`}>Whole Frame</p>
-          <div className="grid grid-cols-3 gap-1.5">
+          <p
+            className="text-[10px] uppercase tracking-widest font-semibold mb-2 px-1"
+            style={{ color: active ? "var(--ed-icon-dim)" : "var(--ed-disabled)" }}
+          >
+            Whole Frame
+          </p>
+          <div className="grid grid-cols-3 gap-1">
             {frameEdits.map((opt) => {
               const Icon = opt.icon;
               return (
@@ -151,13 +167,15 @@ export function EditToolbar({ objectLabel, active, onApply, onClose }: EditToolb
                       setSelected(opt);
                     }
                   }}
-                  className={`flex flex-col items-center gap-1.5 py-2.5 px-1 rounded-xl transition-all group ${
-                    active
-                      ? "text-white/50 hover:text-white hover:bg-white/5 cursor-pointer"
-                      : "text-white/15 cursor-not-allowed"
-                  }`}
+                  className="flex flex-col items-center gap-1.5 py-2.5 px-1 rounded-xl transition-all"
+                  style={{
+                    color: active ? "var(--ed-icon)" : "var(--ed-disabled)",
+                    cursor: active ? "pointer" : "not-allowed",
+                  }}
+                  onMouseEnter={(e) => active && (e.currentTarget.style.background = "var(--ed-hover)")}
+                  onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
                 >
-                  <Icon className={`w-4 h-4 transition-colors ${active ? "group-hover:text-[var(--accent)]" : ""}`} />
+                  <Icon className="w-4 h-4" strokeWidth={1.5} />
                   <span className="text-[10px] font-medium">{opt.label}</span>
                 </button>
               );
@@ -165,33 +183,37 @@ export function EditToolbar({ objectLabel, active, onApply, onClose }: EditToolb
           </div>
         </div>
       ) : (
-        <div className="p-4 space-y-4">
-          {/* Back button */}
+        <div className="p-4 space-y-4 flex-1">
           <button
             onClick={() => setSelected(null)}
-            className="text-white/40 text-xs hover:text-white/70 transition-colors"
+            className="text-xs transition-colors"
+            style={{ color: "var(--ed-subtle)" }}
+            onMouseEnter={(e) => (e.currentTarget.style.color = "var(--ed-muted)")}
+            onMouseLeave={(e) => (e.currentTarget.style.color = "var(--ed-subtle)")}
           >
-            &larr; Back
+            ← Back
           </button>
 
           <div className="flex items-center gap-2">
-            {(() => { const Icon = selected.icon; return <Icon className="w-4 h-4 text-[var(--accent)]" />; })()}
-            <span className="text-white text-sm font-medium">{selected.label}</span>
+            {(() => { const Icon = selected.icon; return <Icon className="w-4 h-4 text-[var(--accent)]" strokeWidth={1.5} />; })()}
+            <span className="text-sm font-medium" style={{ color: "var(--ed-text)" }}>
+              {selected.label}
+            </span>
           </div>
 
-          {/* Color picker */}
           {selected.needsColor && (
             <div>
-              <p className="text-white/40 text-xs mb-2">Color</p>
+              <p className="text-xs mb-2" style={{ color: "var(--ed-subtle)" }}>Color</p>
               <div className="grid grid-cols-6 gap-1.5 mb-2">
                 {COLOR_PRESETS.map((c) => (
                   <button
                     key={c}
                     onClick={() => setColor(c)}
-                    className={`w-8 h-8 rounded-lg border-2 transition-all ${
-                      color === c ? "border-white scale-110" : "border-transparent hover:border-white/30"
-                    }`}
-                    style={{ backgroundColor: c }}
+                    className={`w-7 h-7 rounded-lg border-2 transition-all ${color === c ? "scale-110" : "hover:scale-105"}`}
+                    style={{
+                      backgroundColor: c,
+                      borderColor: color === c ? "var(--ed-text)" : "transparent",
+                    }}
                   />
                 ))}
               </div>
@@ -200,16 +222,20 @@ export function EditToolbar({ objectLabel, active, onApply, onClose }: EditToolb
                 value={color}
                 onChange={(e) => setColor(e.target.value)}
                 placeholder="#FF0000"
-                className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-white text-xs outline-none focus:border-[var(--accent)]/50"
+                className="w-full rounded-xl px-3 py-1.5 text-xs outline-none transition-colors border"
+                style={{
+                  background: "var(--ed-surface-2)",
+                  color: "var(--ed-text)",
+                  borderColor: "var(--ed-border)",
+                }}
               />
             </div>
           )}
 
-          {/* Prompt input */}
           {selected.needsPrompt && (
             <div>
-              <p className="text-white/40 text-xs mb-2">
-                {selected.id === "replace" ? "Replace with..." : selected.id === "bg_replace" ? "New background..." : "Describe..."}
+              <p className="text-xs mb-2" style={{ color: "var(--ed-subtle)" }}>
+                {selected.id === "replace" ? "Replace with…" : selected.id === "bg_replace" ? "New background…" : "Describe…"}
               </p>
               <input
                 type="text"
@@ -218,28 +244,28 @@ export function EditToolbar({ objectLabel, active, onApply, onClose }: EditToolb
                 placeholder={
                   selected.id === "replace" ? "e.g. a red sports car" :
                   selected.id === "bg_replace" ? "e.g. sunset beach" :
-                  selected.id === "gen_recolor" ? "e.g. the car" :
-                  "Describe what you want..."
+                  "Describe what you want…"
                 }
-                className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-white text-xs outline-none focus:border-[var(--accent)]/50"
+                className="w-full rounded-xl px-3 py-2 text-xs outline-none transition-colors border"
+                style={{
+                  background: "var(--ed-surface-2)",
+                  color: "var(--ed-text)",
+                  borderColor: "var(--ed-border)",
+                }}
                 autoFocus
                 onKeyDown={(e) => e.key === "Enter" && handleApply()}
               />
             </div>
           )}
 
-          {/* Scale slider */}
           {selected.needsScale && (
             <div>
               <div className="flex justify-between mb-2">
-                <p className="text-white/40 text-xs">Scale</p>
-                <p className="text-white/60 text-xs font-mono">{scale.toFixed(1)}x</p>
+                <p className="text-xs" style={{ color: "var(--ed-subtle)" }}>Scale</p>
+                <p className="text-xs font-mono" style={{ color: "var(--ed-muted)" }}>{scale.toFixed(1)}x</p>
               </div>
               <input
-                type="range"
-                min="0.3"
-                max="3.0"
-                step="0.1"
+                type="range" min="0.3" max="3.0" step="0.1"
                 value={scale}
                 onChange={(e) => setScale(parseFloat(e.target.value))}
                 className="w-full accent-[var(--accent)]"
@@ -247,11 +273,16 @@ export function EditToolbar({ objectLabel, active, onApply, onClose }: EditToolb
             </div>
           )}
 
-          {/* Apply button */}
           <button
             onClick={handleApply}
             disabled={selected.needsPrompt && !prompt.trim()}
-            className="w-full py-2.5 rounded-xl bg-[var(--accent)] text-white text-sm font-semibold hover:bg-[var(--accent-hover)] transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+            className="w-full py-2.5 rounded-xl text-white text-sm font-semibold transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+            style={{
+              background: "var(--accent)",
+              boxShadow: "0 4px 16px rgba(244,63,94,0.25)",
+            }}
+            onMouseEnter={(e) => (e.currentTarget.style.background = "var(--accent-hover)")}
+            onMouseLeave={(e) => (e.currentTarget.style.background = "var(--accent)")}
           >
             Apply {selected.label}
           </button>
