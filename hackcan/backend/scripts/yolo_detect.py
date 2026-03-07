@@ -9,9 +9,9 @@ FRAME_PATH = BASE_DIR / "output" / "frame.jpg"
 
 device = "mps" if torch.backends.mps.is_available() else "cpu"
 
-model = YOLO("yolov8n.pt")
+model = YOLO("yolo11n.pt")
 
-results = model(str(FRAME_PATH), device=device)
+results = model(str(FRAME_PATH), device=device, conf=0.45, iou=0.4, imgsz=1280)
 
 for result in results:
     boxes = result.boxes
