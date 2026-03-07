@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Claude
+.claude/
+
+# MCP config
+.mcp.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env*.local
