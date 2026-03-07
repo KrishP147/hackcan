@@ -1,0 +1,359 @@
+@import "tailwindcss";
+
+/* ─── Design Tokens ─── */
+:root {
+  --bg: #ffffff;
+  --bg-subtle: #f9fafb;
+  --fg: #171717;
+  --fg-muted: #6b7280;
+  --fg-subtle: #9ca3af;
+  --accent: #f43f5e;
+  --accent-hover: #e11d48;
+  --surface-dark: #111827;
+  --surface-darker: #1f2937;
+  --border: #d1d5db;
+  --border-dark: #374151;
+}
+
+/* ─── Base ─── */
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  color: var(--fg);
+  background: var(--bg);
+}
+
+/* ─── Animations ─── */
+
+/* 1. Logo Intro (Clipabit exact) */
+@keyframes logo-intro {
+  0% {
+    opacity: 0;
+    filter: blur(2px);
+    transform: translateY(-8px) scale(0.92) rotate(-2deg);
+  }
+  60% {
+    opacity: 1;
+    filter: blur(0.4px);
+    transform: translateY(2px) scale(1.02) rotate(0.5deg);
+  }
+  100% {
+    opacity: 1;
+    filter: blur(0px);
+    transform: translateY(0) scale(1) rotate(0deg);
+  }
+}
+
+/* 2. Fade Up */
+@keyframes fade-up {
+  0% {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* 3. Scroll Ticker (Clipabit exact) */
+@keyframes scroll-ticker {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(-50%);
+  }
+}
+
+/* 4. Carousel Progress */
+@keyframes carousel-progress {
+  0% {
+    transform: scaleX(0);
+  }
+  100% {
+    transform: scaleX(1);
+  }
+}
+
+/* 5. Drop Zone Pulse */
+@keyframes pulse-border {
+  0%,
+  100% {
+    border-color: var(--accent);
+    opacity: 1;
+  }
+  50% {
+    border-color: var(--accent);
+    opacity: 0.5;
+  }
+}
+
+/* ─── Animation Utility Classes ─── */
+.animate-logo-intro {
+  opacity: 0;
+  filter: blur(2px);
+  transform: translateY(-8px) scale(0.92) rotate(-2deg);
+  animation: logo-intro 0.7s cubic-bezier(0.22, 1, 0.36, 1) 0.12s forwards;
+}
+
+.animate-fade-up {
+  opacity: 0;
+  animation: fade-up 0.6s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+.animate-scroll-ticker {
+  will-change: transform;
+  backface-visibility: hidden;
+  contain: layout style paint;
+  animation: scroll-ticker 20s linear infinite;
+}
+
+.animate-pulse-border {
+  border-style: solid;
+  border-color: var(--accent);
+  animation: pulse-border 1.5s ease-in-out infinite;
+}
+
+/* Stagger delays */
+.stagger-1 { animation-delay: 0.2s; }
+.stagger-2 { animation-delay: 0.4s; }
+.stagger-3 { animation-delay: 0.6s; }
+.stagger-4 { animation-delay: 0.8s; }
+.stagger-5 { animation-delay: 1.0s; }
+
+/* ─── Rotating Word (Clipabit-style) ─── */
+@keyframes word-cycle {
+  0% { opacity: 0; transform: translateY(18px) scale(0.93); filter: blur(3px); }
+  14% { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+  80% { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+  100% { opacity: 0; transform: translateY(-18px) scale(0.93); filter: blur(3px); }
+}
+
+.rotating-word {
+  display: inline-block;
+  font-weight: 700;
+  animation: word-cycle 3s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+/* ─── Color Cycle for accent keywords (flash-reveal style, slow) ─── */
+@keyframes color-cycle {
+  0%,  18% { color: #F43F5E; opacity: 1; }
+  21%      { color: #F43F5E; opacity: 0; }
+  22%      { color: #0EA5E9; opacity: 0; }
+  25%, 43% { color: #0EA5E9; opacity: 1; }
+  46%      { color: #0EA5E9; opacity: 0; }
+  47%      { color: #F59E0B; opacity: 0; }
+  50%, 68% { color: #F59E0B; opacity: 1; }
+  71%      { color: #F59E0B; opacity: 0; }
+  72%      { color: #10B981; opacity: 0; }
+  75%, 93% { color: #10B981; opacity: 1; }
+  96%      { color: #10B981; opacity: 0; }
+  97%      { color: #F43F5E; opacity: 0; }
+  100%     { color: #F43F5E; opacity: 1; }
+}
+
+.animate-color-cycle {
+  display: inline-block;
+  animation: color-cycle 20s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+}
+
+/* ─── Keyword Highlight (no underline) ─── */
+.keyword-highlight {
+  display: inline-block;
+  font-weight: 700;
+  padding: 0.125rem 0.25rem;
+  border-radius: 0.125rem;
+}
+
+/* ─── Gradient Text (smooth flowing color for "every") ─── */
+@keyframes gradient-shift {
+  0%   { background-position: 0% center; }
+  100% { background-position: 200% center; }
+}
+
+.animate-gradient-text {
+  background: linear-gradient(90deg, #F43F5E, #F59E0B, #10B981, #0EA5E9, #F43F5E);
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  animation: gradient-shift 5s linear infinite;
+  display: inline-block;
+}
+
+/* ─── Shimmer Cycle ("anything" — swipe PAINTS the new color across the text) ─── */
+/*
+  Each gradient: oldColor (left 33%) → white flash (center) → newColor (right 33%)
+  background-size: 300% so position 0%=oldColor, 50%=flash, 100%=newColor
+  As the position sweeps 0→100%, the text is literally repainted left-to-right.
+*/
+@keyframes shimmer-cycle {
+  /* Red → Blue */
+  0% {
+    background-image: linear-gradient(90deg, #F43F5E 0%, #F43F5E 33%, #ffffff 50%, #0EA5E9 67%, #0EA5E9 100%);
+    background-position: 0% center;
+    animation-timing-function: ease-in-out;
+  }
+  24.9% {
+    background-image: linear-gradient(90deg, #F43F5E 0%, #F43F5E 33%, #ffffff 50%, #0EA5E9 67%, #0EA5E9 100%);
+    background-position: 100% center;
+    animation-timing-function: steps(1, start);
+  }
+  /* Blue → Amber */
+  25% {
+    background-image: linear-gradient(90deg, #0EA5E9 0%, #0EA5E9 33%, #ffffff 50%, #F59E0B 67%, #F59E0B 100%);
+    background-position: 0% center;
+    animation-timing-function: ease-in-out;
+  }
+  49.9% {
+    background-image: linear-gradient(90deg, #0EA5E9 0%, #0EA5E9 33%, #ffffff 50%, #F59E0B 67%, #F59E0B 100%);
+    background-position: 100% center;
+    animation-timing-function: steps(1, start);
+  }
+  /* Amber → Green */
+  50% {
+    background-image: linear-gradient(90deg, #F59E0B 0%, #F59E0B 33%, #ffffff 50%, #10B981 67%, #10B981 100%);
+    background-position: 0% center;
+    animation-timing-function: ease-in-out;
+  }
+  74.9% {
+    background-image: linear-gradient(90deg, #F59E0B 0%, #F59E0B 33%, #ffffff 50%, #10B981 67%, #10B981 100%);
+    background-position: 100% center;
+    animation-timing-function: steps(1, start);
+  }
+  /* Green → Red */
+  75% {
+    background-image: linear-gradient(90deg, #10B981 0%, #10B981 33%, #ffffff 50%, #F43F5E 67%, #F43F5E 100%);
+    background-position: 0% center;
+    animation-timing-function: ease-in-out;
+  }
+  99.9% {
+    background-image: linear-gradient(90deg, #10B981 0%, #10B981 33%, #ffffff 50%, #F43F5E 67%, #F43F5E 100%);
+    background-position: 100% center;
+    animation-timing-function: steps(1, start);
+  }
+  100% {
+    background-image: linear-gradient(90deg, #F43F5E 0%, #F43F5E 33%, #ffffff 50%, #0EA5E9 67%, #0EA5E9 100%);
+    background-position: 0% center;
+  }
+}
+
+.animate-text-shimmer {
+  background-size: 300% auto;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  animation: shimmer-cycle 16s linear infinite;
+  display: inline-block;
+}
+
+/* ─── Card Resize Animation ─── */
+@keyframes card-resize {
+  0%, 100% { transform: scale(0.65); }
+  50%       { transform: scale(1); }
+}
+
+/* ─── Per-word Animations (Rotating Hero Word) ─── */
+
+/* "anything." — constant hue spin */
+@keyframes hue-spin {
+  0%   { filter: hue-rotate(0deg); }
+  100% { filter: hue-rotate(360deg); }
+}
+.animate-hue-spin {
+  color: #F43F5E;
+  display: inline-block;
+  animation: hue-spin 5s linear infinite;
+}
+
+/* Detect — vertical scan line sweeps left-to-right across the word */
+@keyframes word-detect-scan {
+  0%        { left: -4%;  opacity: 0; }
+  5%, 92%   { opacity: 1; }
+  100%      { left: 104%; opacity: 0; }
+}
+.word-anim-detect {
+  display: inline-block;
+  position: relative;
+  padding: 0 4px;
+}
+.word-anim-detect::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -4%;
+  width: 2px;
+  background: currentColor;
+  border-radius: 1px;
+  box-shadow: 0 0 8px 2px currentColor;
+  animation: word-detect-scan 2s ease-in-out infinite;
+}
+
+/* Remove — opacity flicker (erasing effect) */
+@keyframes word-remove {
+  0%, 20%, 80%, 100% { opacity: 1; }
+  45%, 55%           { opacity: 0.08; }
+}
+.word-anim-remove {
+  animation: word-remove 2.5s ease-in-out infinite;
+}
+
+/* Recolor — hue rotation on the word's color */
+@keyframes word-recolor {
+  0%   { filter: hue-rotate(0deg); }
+  100% { filter: hue-rotate(360deg); }
+}
+.word-anim-recolor {
+  display: inline-block;
+  animation: word-recolor 3s linear infinite;
+}
+
+/* Resize — scale pulse */
+@keyframes word-resize {
+  0%, 100% { transform: scale(1); }
+  50%       { transform: scale(1.35); }
+}
+.word-anim-resize {
+  display: inline-block;
+  transform-origin: center;
+  animation: word-resize 1.6s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+}
+
+/* ─── Feature Preview Animations ─── */
+@keyframes preview-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.35; }
+}
+
+@keyframes preview-scan {
+  0%   { transform: translateY(-100px); opacity: 0; }
+  10%  { opacity: 0.7; }
+  90%  { opacity: 0.7; }
+  100% { transform: translateY(100px); opacity: 0; }
+}
+
+@keyframes preview-hue {
+  0%   { filter: hue-rotate(0deg); }
+  100% { filter: hue-rotate(360deg); }
+}
+
+/* ─── Clipabit-style Global Transitions ─── */
+button,
+a {
+  transition: all 300ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* ─── Reduced Motion ─── */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
