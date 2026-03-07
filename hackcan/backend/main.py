@@ -3,7 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from dotenv import load_dotenv
 from pydantic import BaseModel
+from typing import Optional
 import shutil
+import asyncio
 
 from services import cloudinary_service, project_manager, ffmpeg_service, yolo_service, sam2_service
 
@@ -125,3 +127,80 @@ async def get_mask(project_id: str, mask_index: int):
     if not mask_path.exists():
         return {"error": "Mask not found"}
     return FileResponse(mask_path, media_type="image/png")
+
+
+# --- Edit ---
+
+class EditRequest(BaseModel):
+    project_id: str
+    edit_type: str  # "recolor", "resize", "replace"
+    color: Optional[str] = None  # hex without #, e.g. "FF0000"
+    scale: Optional[float] = None
+    replacement_public_id: Optional[str] = None
+
+@app.post("/edit")
+async def edit_frames(req: EditRequest):
+    project_dir = project_manager.get_project_dir(req.project_id)
+    frames_dir = project_dir / "frames"
+    masks_dir = project_dir / "masks"
+    edited_dir = project_dir / "edited"
+    edited_dir.mkdir(exist_ok=True)
+
+    frame_files = sorted(frames_dir.glob("frame_*.jpg"))
+    mask_files = sorted(masks_dir.glob("mask_*.png"))
+
+    if len(frame_files) == 0 or len(mask_files) == 0:
+        return {"error": "No frames or masks found. Run /extract and /segment first."}
+
+    # Upload all frames and masks to Cloudinary
+    frame_ids = {}
+    mask_ids = {}
+
+    for f in frame_files:
+        result = cloudinary_service.upload_file(str(f), folder=f"frameshift/{req.project_id}/frames")
+        frame_ids[f.name] = result["public_id"]
+
+    for m in mask_files:
+        result = cloudinary_service.upload_file(str(m), folder=f"frameshift/{req.project_id}/masks")
+        mask_ids[m.name] = result["public_id"]
+
+    # Get mask bbox from first mask for positioning
+    from PIL import Image
+    import numpy as np
+    anchor_mask = np.array(Image.open(mask_files[0]))
+    rows = np.any(anchor_mask > 0, axis=1)
+    cols = np.any(anchor_mask > 0, axis=0)
+    y_min, y_max = np.where(rows)[0][[0, -1]]
+    x_min, x_max = np.where(cols)[0][[0, -1]]
+    bbox_x, bbox_y = int(x_min), int(y_min)
+    bbox_w, bbox_h = int(x_max - x_min), int(y_max - y_min)
+
+    # Apply transforms and download results
+    async def process_frame(frame_name, mask_name, index):
+        f_id = frame_ids[frame_name]
+        m_id = mask_ids[mask_name]
+
+        if req.edit_type == "recolor":
+            url = await cloudinary_service.apply_recolor(f_id, m_id, req.color)
+        elif req.edit_type == "resize":
+            url = await cloudinary_service.apply_resize(f_id, m_id, bbox_x, bbox_y, bbox_w, bbox_h, req.scale)
+        elif req.edit_type == "replace":
+            url = await cloudinary_service.apply_replace(f_id, req.replacement_public_id, bbox_x, bbox_y, bbox_w, bbox_h)
+        else:
+            return
+
+        save_path = edited_dir / f"frame_{index:04d}.jpg"
+        await cloudinary_service.download_url(url, save_path)
+
+    # Process in batches of 20 concurrent
+    batch_size = 20
+    frame_list = sorted(frame_ids.keys())
+    mask_list = sorted(mask_ids.keys())
+
+    for i in range(0, len(frame_list), batch_size):
+        batch = []
+        for j in range(i, min(i + batch_size, len(frame_list))):
+            batch.append(process_frame(frame_list[j], mask_list[j], j + 1))
+        await asyncio.gather(*batch)
+
+    return {"project_id": req.project_id, "edited_frame_count": len(frame_list), "status": "done"}
