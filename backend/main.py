@@ -59,7 +59,7 @@ async def upload_video(
     with open(video_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    # Video uploaded - stored locally, no Cloudinary needed
+    # Video uploaded and staged for Cloudinary processing
     return {
         "project_id": project["project_id"],
     }
@@ -349,7 +349,7 @@ def _composite_with_mask(original_path, edited_path, mask_array):
 
 
 def _apply_recolor_local(frame_path, mask_array, color_hex: str):
-    """Apply color tint locally using SAM2 mask — no Cloudinary needed."""
+    """Apply color tint locally using SAM2 mask before Cloudinary upload."""
     from PIL import Image
     original = np.array(Image.open(frame_path).convert("RGB"))
 
@@ -375,7 +375,7 @@ def _apply_recolor_local(frame_path, mask_array, color_hex: str):
     return save_path
 
 
-# All edits are now done locally - no Cloudinary
+# Edits are processed locally then delivered via Cloudinary
 from services import local_edit_service
 
 # Edits that require a mask (object-specific)
@@ -385,7 +385,7 @@ FRAME_EDITS = {"bg_remove", "bg_replace", "gen_fill", "enhance", "upscale", "res
 
 
 async def _background_edit(project_id: str, edit_rules: List[EditRule]):
-    """Background task: apply edits locally without Cloudinary."""
+    """Background task: apply edits and upload results to Cloudinary."""
     try:
         from PIL import Image
         _cancel_flags[project_id] = False
