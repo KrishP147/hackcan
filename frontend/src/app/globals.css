@@ -426,6 +426,17 @@ a {
   50% { opacity: 1; }
 }
 
+@keyframes glow-pulse {
+  0%, 100% {
+    opacity: 0.8;
+    filter: drop-shadow(0 0 8px rgba(244,63,94,0.8)) drop-shadow(0 0 16px rgba(244,63,94,0.6)) drop-shadow(0 0 24px rgba(244,63,94,0.4));
+  }
+  50% {
+    opacity: 1;
+    filter: drop-shadow(0 0 12px rgba(244,63,94,1)) drop-shadow(0 0 24px rgba(244,63,94,0.8)) drop-shadow(0 0 36px rgba(244,63,94,0.6));
+  }
+}
+
 .animate-slide-in-right {
   animation: slide-in-right 300ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
 }

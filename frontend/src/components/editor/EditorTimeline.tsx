@@ -3,6 +3,13 @@
 import { useCallback, useRef, useState } from "react";
 import { Play, Pause, SkipBack, SkipForward } from "lucide-react";
 
+interface ChangeMarker {
+  id: string;
+  frame: number;
+  editType: string;
+  timestamp: number;
+}
+
 interface EditorTimelineProps {
   videoLoaded: boolean;
   currentFrame: number;
@@ -14,10 +21,12 @@ interface EditorTimelineProps {
   zoom: number;
   editRangeStart: number;
   editRangeEnd: number;
+  changeMarkers: ChangeMarker[];
   onFrameChange: (frame: number) => void;
   onTogglePlay: () => void;
   onZoomChange: (zoom: number) => void;
   onEditRangeChange: (start: number, end: number) => void;
+  onMarkerDrag?: (markerId: string, newFrame: number) => void;
 }
 
 function formatTime(seconds: number): string {
@@ -37,10 +46,12 @@ export function EditorTimeline({
   zoom,
   editRangeStart,
   editRangeEnd,
+  changeMarkers,
   onFrameChange,
   onTogglePlay,
   onZoomChange,
   onEditRangeChange,
+  onMarkerDrag,
 }: EditorTimelineProps) {
   const trackRef = useRef<HTMLDivElement>(null);
   const rangeRef = useRef<HTMLDivElement>(null);
@@ -163,6 +174,67 @@ export function EditorTimeline({
       {/* Timeline track area */}
       <div className="flex-1 flex flex-col px-4 py-2.5 gap-2">
         <div className="relative">
+          {/* Change markers above timeline */}
+          {videoLoaded && changeMarkers.length > 0 && (
+            <div className="relative h-4 mb-1">
+              {changeMarkers.map((marker) => {
+                const markerPct = totalFrames > 0 ? (marker.frame / Math.max(totalFrames - 1, 1)) * 100 : 0;
+                return (
+                  <div
+                    key={marker.id}
+                    className="absolute top-0 cursor-grab active:cursor-grabbing z-20"
+                    style={{
+                      left: `calc(${markerPct}% - 4px)`,
+                    }}
+                    onPointerDown={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      if (!trackRef.current || !onMarkerDrag) return;
+
+                      const onMove = (ev: PointerEvent) => {
+                        if (!trackRef.current) return;
+                        const rect = trackRef.current.getBoundingClientRect();
+                        const pct = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+                        const newFrame = Math.round(pct * (totalFrames - 1));
+                        // Update visual position during drag
+                        const markerEl = e.currentTarget;
+                        const newPct = totalFrames > 0 ? (newFrame / Math.max(totalFrames - 1, 1)) * 100 : 0;
+                        markerEl.style.left = `calc(${newPct}% - 4px)`;
+                      };
+
+                      const onUp = (ev: PointerEvent) => {
+                        if (!trackRef.current) return;
+                        const rect = trackRef.current.getBoundingClientRect();
+                        const pct = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+                        const newFrame = Math.round(pct * (totalFrames - 1));
+                        // Only update state on drag end
+                        onMarkerDrag(marker.id, newFrame);
+                        window.removeEventListener("pointermove", onMove);
+                        window.removeEventListener("pointerup", onUp);
+                      };
+
+                      window.addEventListener("pointermove", onMove);
+                      window.addEventListener("pointerup", onUp);
+                    }}
+                  >
+                    <div
+                      className="w-2 h-2 rounded-full border-2 transition-all hover:scale-125"
+                      style={{
+                        background: "var(--accent)",
+                        borderColor: "var(--accent)",
+                        boxShadow: "0 0 0 2px var(--ed-surface)",
+                      }}
+                    />
+                    <div
+                      className="absolute top-2 left-1/2 -translate-x-1/2 w-0.5 h-2"
+                      style={{ background: "var(--accent)" }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
           {/* Time markers */}
           <div className="flex justify-between text-[9px] font-mono mb-1.5 px-0.5" style={{ color: "var(--ed-disabled)" }}>
             {Array.from({ length: 6 }, (_, i) => (

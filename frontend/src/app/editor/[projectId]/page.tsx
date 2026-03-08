@@ -6,14 +6,25 @@ import { EditorTimeline } from "@/components/editor/EditorTimeline";
 import { EditToolbar } from "@/components/editor/EditToolbar";
 import { AIChatPane } from "@/components/editor/AIChatPane";
 import { Toast } from "@/components/editor/Toast";
+import { AIProgressOverlay } from "@/components/editor/AIProgressOverlay";
+import { EditProgressOverlay } from "@/components/editor/EditProgressOverlay";
 import { useEditorState } from "@/hooks/useEditorState";
 import { useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
+import { useVideoStore } from "@/stores/videoStore";
 
 export default function EditorPage() {
   const params = useParams();
   const projectId = params.projectId as string;
+  const setCurrentProject = useVideoStore((state) => state.setCurrentProject);
   const editor = useEditorState(projectId);
+
+  // Set current project in Zustand when page loads
+  useEffect(() => {
+    if (projectId) {
+      setCurrentProject(projectId);
+    }
+  }, [projectId, setCurrentProject]);
   const playIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [isDark, setIsDark] = useState(false);
 
@@ -98,6 +109,7 @@ export default function EditorPage() {
           onUpload={editor.loadVideo}
           onApplyEdit={editor.applyEditAction}
           onSegmentAtPoint={editor.segmentAtPoint}
+          onCancelEdit={editor.cancelEdit}
         />
 
         <EditToolbar
@@ -106,9 +118,15 @@ export default function EditorPage() {
               ? editor.detections.find((d) => d.id === editor.selectedObjectId)?.label || "object"
               : "selection"
           }
-          active={!editor.isSegmenting && editor.maskCount > 0}
+          active={!editor.isSegmenting && editor.videoLoaded}
+          hasMask={editor.maskCount > 0}
+          editApplied={editor.editVersion > 0}
           onApply={editor.applyEditAction}
+          onRefine={editor.refineFrame}
+          onPropagate={editor.propagateEdit}
+          onUndo={editor.undoEdit}
           onClose={editor.closeEditPanel}
+          isRefining={editor.isRefining}
         />
 
         <AIChatPane
@@ -137,16 +155,32 @@ export default function EditorPage() {
         zoom={editor.zoom}
         editRangeStart={editor.editRangeStart}
         editRangeEnd={editor.editRangeEnd}
+        changeMarkers={editor.changeMarkers}
         onFrameChange={editor.setCurrentFrame}
         onTogglePlay={editor.togglePlay}
         onZoomChange={editor.setZoom}
         onEditRangeChange={editor.setEditRange}
+        onMarkerDrag={editor.handleMarkerDrag}
       />
 
       <Toast
         message={editor.toastMessage}
         show={editor.showToast}
         onHide={editor.hideToast}
+      />
+
+      <AIProgressOverlay
+        show={editor.aiEditStatus === "applying"}
+        progress={editor.aiEditProgress}
+        interpolationProgress={editor.aiInterpolationProgress}
+        phase={editor.aiEditPhase}
+        status={editor.aiEditStatus}
+      />
+
+      <EditProgressOverlay
+        show={editor.isProcessing && (editor.editStatus === "uploading" || editor.editStatus === "editing")}
+        progress={editor.editProgress}
+        status={editor.editStatus}
       />
     </div>
   );

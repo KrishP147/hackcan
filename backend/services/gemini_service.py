@@ -5,6 +5,9 @@ from google import genai
 from google.genai import types
 from google.genai.types import FinishReason
 from dotenv import load_dotenv
+import numpy as np
+from PIL import Image
+from io import BytesIO
 
 # Load environment variables from backend/.env
 env_path = Path(__file__).resolve().parent.parent / ".env"
@@ -34,7 +37,7 @@ def _get_client():
     return _client
 
 
-async def edit_frame(frame_path: Path, prompt: str) -> bytes:
+async def edit_frame(frame_path: Path, prompt: str, mask_path: Path | None = None) -> bytes:
     """Send a frame image + text prompt to Gemini and return the edited image bytes."""
     import asyncio
     
@@ -111,11 +114,21 @@ async def edit_frame(frame_path: Path, prompt: str) -> bytes:
         if not hasattr(candidate, 'content') or not candidate.content.parts:
             raise RuntimeError("No content parts in response")
 
+        edited_bytes = None
         for part in candidate.content.parts:
             if hasattr(part, 'inline_data') and part.inline_data and part.inline_data.mime_type.startswith("image/"):
-                return part.inline_data.data
-
-        raise RuntimeError("Gemini did not return an image in the response")
+                edited_bytes = part.inline_data.data
+                break
+        
+        if not edited_bytes:
+            raise RuntimeError("Gemini did not return an image in the response")
+        
+        # If mask is provided, composite the edited result with the original using the mask
+        if mask_path and mask_path.exists():
+            mask_array = np.array(Image.open(mask_path).convert("L"))
+            edited_bytes = _composite_ai_edit_with_mask(frame_path, edited_bytes, mask_array)
+        
+        return edited_bytes
     except Exception as e:
         # Re-raise with more context
         error_str = str(e)
@@ -132,13 +145,59 @@ async def edit_frame(frame_path: Path, prompt: str) -> bytes:
             raise RuntimeError(f"Gemini API error: {error_str}")
 
 
-async def edit_frame_with_reference(frame_path: Path, prompt: str, reference_frame_path: Path | None = None) -> bytes:
+def _composite_ai_edit_with_mask(original_path: Path, edited_bytes: bytes, mask_array: np.ndarray) -> bytes:
+    """Composite AI-edited frame onto original using mask. Returns edited image bytes.
+    
+    Args:
+        original_path: Path to original frame
+        edited_bytes: Bytes of AI-edited image
+        mask_array: Binary mask array (white pixels = object, black = background)
+    
+    Returns:
+        Composited image as bytes
+    """
+    # Load original frame
+    original = np.array(Image.open(original_path).convert("RGB"))
+    
+    # Decode edited bytes to numpy array
+    from io import BytesIO
+    edited_img = Image.open(BytesIO(edited_bytes)).convert("RGB")
+    edited = np.array(edited_img)
+    
+    # Resize mask to match frame dimensions if needed
+    mask = mask_array
+    if mask.shape[:2] != original.shape[:2]:
+        mask_img = Image.fromarray(mask).resize((original.shape[1], original.shape[0]), Image.NEAREST)
+        mask = np.array(mask_img)
+    
+    # Normalize mask to 0-1 float, expand to 3 channels
+    if mask.ndim == 3:
+        mask = mask[:, :, 0]
+    alpha = (mask > 0).astype(np.float32)[:, :, np.newaxis]
+    
+    # Resize edited to match original if dimensions differ
+    if edited.shape[:2] != original.shape[:2]:
+        edited_img = Image.fromarray(edited).resize((original.shape[1], original.shape[0]), Image.LANCZOS)
+        edited = np.array(edited_img)
+    
+    # Composite: edited where mask=white, original elsewhere
+    result = (alpha * edited + (1 - alpha) * original).astype(np.uint8)
+    
+    # Convert back to bytes
+    result_img = Image.fromarray(result)
+    output = BytesIO()
+    result_img.save(output, format="JPEG", quality=95)
+    return output.getvalue()
+
+
+async def edit_frame_with_reference(frame_path: Path, prompt: str, reference_frame_path: Path | None = None, mask_path: Path | None = None) -> bytes:
     """Edit a frame using Gemini, optionally with a reference frame for style consistency.
     
     Args:
         frame_path: Path to the target frame to transform
         prompt: Edit instruction text
         reference_frame_path: Optional path to a reference frame to use as style guide
+        mask_path: Optional path to mask file - if provided, edits will only apply to masked region
     
     Returns:
         Edited image bytes
@@ -226,11 +285,21 @@ async def edit_frame_with_reference(frame_path: Path, prompt: str, reference_fra
         if not hasattr(candidate, 'content') or not candidate.content.parts:
             raise RuntimeError("No content parts in response")
 
+        edited_bytes = None
         for part in candidate.content.parts:
             if hasattr(part, 'inline_data') and part.inline_data and part.inline_data.mime_type.startswith("image/"):
-                return part.inline_data.data
-
-        raise RuntimeError("Gemini did not return an image in the response")
+                edited_bytes = part.inline_data.data
+                break
+        
+        if not edited_bytes:
+            raise RuntimeError("Gemini did not return an image in the response")
+        
+        # If mask is provided, composite the edited result with the original using the mask
+        if mask_path and mask_path.exists():
+            mask_array = np.array(Image.open(mask_path).convert("L"))
+            edited_bytes = _composite_ai_edit_with_mask(frame_path, edited_bytes, mask_array)
+        
+        return edited_bytes
     except Exception as e:
         # Re-raise with more context
         error_str = str(e)

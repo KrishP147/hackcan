@@ -3,11 +3,14 @@
 import { useCallback, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Upload, Loader2 } from "lucide-react";
+import { useVideoStore } from "@/stores/videoStore";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 export function DropZone() {
   const router = useRouter();
+  const addProject = useVideoStore((state) => state.addProject);
+  const setCurrentProject = useVideoStore((state) => state.setCurrentProject);
   const [isDragging, setIsDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [status, setStatus] = useState("");
@@ -22,6 +25,15 @@ export function DropZone() {
 
     const res = await fetch(`${API_URL}/upload`, { method: "POST", body: formData });
     const data = await res.json();
+
+    // Save to Zustand store for persistence
+    addProject({
+      projectId: data.project_id,
+      videoName: file.name,
+      uploadedAt: Date.now(),
+      status: "created",
+    });
+    setCurrentProject(data.project_id);
 
     // Redirect immediately — editor will kick off extract and poll for readiness
     router.push(`/editor/${data.project_id}`);

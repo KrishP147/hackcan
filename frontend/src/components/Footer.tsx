@@ -3,6 +3,7 @@
 import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Play, Loader2 } from "lucide-react";
+import { useVideoStore } from "@/stores/videoStore";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -10,6 +11,8 @@ export function Footer() {
   const [uploading, setUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const router = useRouter();
+  const addProject = useVideoStore((state) => state.addProject);
+  const setCurrentProject = useVideoStore((state) => state.setCurrentProject);
 
   async function uploadFile(file: File) {
     setUploading(true);
@@ -17,6 +20,16 @@ export function Footer() {
     formData.append("file", file);
     const res = await fetch(`${API_URL}/upload`, { method: "POST", body: formData });
     const data = await res.json();
+    
+    // Save to Zustand store for persistence
+    addProject({
+      projectId: data.project_id,
+      videoName: file.name,
+      uploadedAt: Date.now(),
+      status: "created",
+    });
+    setCurrentProject(data.project_id);
+    
     router.push(`/editor/${data.project_id}`);
   }
 

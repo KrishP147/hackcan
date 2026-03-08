@@ -1,7 +1,6 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
-import { Crosshair } from "lucide-react";
+import { useCallback, useRef, useEffect } from "react";
 import type { Detection, EditMode, EditParams } from "@/lib/mock-data";
 import { BoundingBox } from "./BoundingBox";
 import type { EditAction } from "./EditToolbar";
@@ -33,6 +32,7 @@ interface EditorCanvasProps {
   onUpload: () => void;
   onApplyEdit: (action: EditAction, params: { color?: string; prompt?: string; scale?: number }) => void;
   onSegmentAtPoint: (clickX: number, clickY: number) => void;
+  onCancelEdit: () => void;
 }
 
 export function EditorCanvas({
@@ -60,27 +60,99 @@ export function EditorCanvas({
   onUpload,
   onApplyEdit,
   onSegmentAtPoint,
+  onCancelEdit,
 }: EditorCanvasProps) {
-  const [segmentMode, setSegmentMode] = useState(false);
   const imgRef = useRef<HTMLDivElement>(null);
+  const borderCanvasRef = useRef<HTMLCanvasElement>(null);
 
   const handleCanvasClick = useCallback(
     (e: React.MouseEvent) => {
-      if (!segmentMode || !imgRef.current || !frameWidth || !frameHeight) {
-        onSelectObject(null);
+      if (!imgRef.current || !frameWidth || !frameHeight) {
         return;
       }
       e.stopPropagation();
       const rect = imgRef.current.getBoundingClientRect();
       const relX = (e.clientX - rect.left) / rect.width;
       const relY = (e.clientY - rect.top) / rect.height;
+      // Only segment if click is within the frame bounds
+      if (relX < 0 || relX > 1 || relY < 0 || relY > 1) return;
       const clickX = Math.round(relX * frameWidth);
       const clickY = Math.round(relY * frameHeight);
       onSegmentAtPoint(clickX, clickY);
-      setSegmentMode(false);
     },
-    [segmentMode, frameWidth, frameHeight, onSelectObject, onSegmentAtPoint]
+    [frameWidth, frameHeight, onSegmentAtPoint]
   );
+
+  // Draw border outline on canvas when mask exists
+  useEffect(() => {
+    if (!borderCanvasRef.current || !projectId || maskCount === 0 || isSegmenting || aiEditStatus === "preview") {
+      return;
+    }
+
+    const canvas = borderCanvasRef.current;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    // Set canvas size to match container
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width;
+    canvas.height = rect.height;
+
+    // Load mask image
+    const maskImg = new Image();
+    maskImg.crossOrigin = "anonymous";
+    maskImg.onload = () => {
+      // Clear canvas
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Calculate scaling to fit mask in canvas
+      const scaleX = canvas.width / maskImg.width;
+      const scaleY = canvas.height / maskImg.height;
+      const scale = Math.min(scaleX, scaleY);
+      const x = (canvas.width - maskImg.width * scale) / 2;
+      const y = (canvas.height - maskImg.height * scale) / 2;
+
+      // Draw mask to get pixel data
+      ctx.drawImage(maskImg, x, y, maskImg.width * scale, maskImg.height * scale);
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const data = imageData.data;
+
+      // Clear canvas again
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Find edges and draw glowing border
+      ctx.strokeStyle = "rgba(244,63,94,1)";
+      ctx.lineWidth = 3;
+      ctx.shadowBlur = 8;
+      ctx.shadowColor = "rgba(244,63,94,1)";
+
+      // Simple edge detection - draw border where mask pixels meet non-mask pixels
+      for (let y = 1; y < canvas.height - 1; y++) {
+        for (let x = 1; x < canvas.width - 1; x++) {
+          const idx = (y * canvas.width + x) * 4;
+          const isMask = data[idx] > 128; // White pixel in mask
+
+          // Check neighbors
+          const topIdx = ((y - 1) * canvas.width + x) * 4;
+          const bottomIdx = ((y + 1) * canvas.width + x) * 4;
+          const leftIdx = (y * canvas.width + (x - 1)) * 4;
+          const rightIdx = (y * canvas.width + (x + 1)) * 4;
+
+          const topIsMask = data[topIdx] > 128;
+          const bottomIsMask = data[bottomIdx] > 128;
+          const leftIsMask = data[leftIdx] > 128;
+          const rightIsMask = data[rightIdx] > 128;
+
+          // Draw pixel if it's on the edge
+          if (isMask && (!topIsMask || !bottomIsMask || !leftIsMask || !rightIsMask)) {
+            ctx.fillStyle = "rgba(244,63,94,1)";
+            ctx.fillRect(x, y, 1, 1);
+          }
+        }
+      }
+    };
+    maskImg.src = `${API_URL}/mask/${projectId}/${currentFrame + 1}?v=${maskVersion}`;
+  }, [projectId, currentFrame, maskCount, maskVersion, isSegmenting, aiEditStatus, frameWidth, frameHeight]);
 
   if (!videoLoaded) {
     return <EmptyCanvas onUpload={onUpload} />;
@@ -101,30 +173,6 @@ export function EditorCanvas({
       className="flex-1 flex items-center justify-center overflow-hidden relative"
       style={{ background: "var(--ed-bg)" }}
     >
-      {/* Segment toggle - hide when showing AI preview */}
-      {aiEditStatus !== "preview" && (
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            setSegmentMode(!segmentMode);
-          }}
-          className="absolute top-4 right-4 z-30 flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-medium transition-all border"
-          style={segmentMode ? {
-            background: "var(--accent)",
-            color: "#fff",
-            borderColor: "var(--accent)",
-            boxShadow: "0 4px 16px rgba(244,63,94,0.3)",
-          } : {
-            background: "var(--ed-surface)",
-            color: "var(--ed-icon)",
-            borderColor: "var(--ed-border)",
-          }}
-        >
-          <Crosshair className="w-3.5 h-3.5" />
-          {segmentMode ? "Click to segment" : "Segment"}
-        </button>
-      )}
-
       {isDetecting && (
         <div className="absolute inset-0 z-20 pointer-events-none animate-detection-shimmer" />
       )}
@@ -135,7 +183,7 @@ export function EditorCanvas({
       >
         <div
           ref={imgRef}
-          className={`w-[768px] h-[432px] rounded-2xl overflow-hidden relative shadow-2xl ${segmentMode ? "cursor-crosshair" : ""}`}
+          className="w-[768px] h-[432px] rounded-2xl overflow-hidden relative shadow-2xl cursor-crosshair"
           style={{
             background: "var(--ed-surface-2)",
             boxShadow: "0 25px 60px rgba(0,0,0,0.25)",
@@ -169,27 +217,18 @@ export function EditorCanvas({
             </div>
           )}
 
-          {segmentMode && (
-            <div className="absolute inset-0 rounded-2xl border-2 border-[var(--accent)] pointer-events-none z-20" />
-          )}
-
-          {isProcessing && (
-            <div className="absolute inset-0 flex items-center justify-center z-20 rounded-2xl" style={{ background: "rgba(0,0,0,0.5)" }}>
-              <div className="flex flex-col items-center gap-3">
-                <div className="w-8 h-8 border-2 border-[var(--accent)] border-t-transparent rounded-full animate-spin" />
-                <span className="text-white text-sm font-medium">Applying edit…</span>
-              </div>
-            </div>
-          )}
 
           {/* Hide masks and detections when showing AI preview */}
           {aiEditStatus !== "preview" && projectId && maskCount > 0 && !isSegmenting && (
-            <img
-              src={`${API_URL}/mask/${projectId}/${currentFrame + 1}?v=${maskVersion}`}
-              alt="Segmentation mask"
-              className="absolute inset-0 w-full h-full object-contain pointer-events-none z-[1] mix-blend-screen opacity-40"
-              style={{ filter: "hue-rotate(-30deg) saturate(3)" }}
-            />
+            <>
+              {/* Draw border outline on canvas - no mask overlay */}
+              <canvas
+                ref={borderCanvasRef}
+                className="absolute inset-0 w-full h-full pointer-events-none z-[2]"
+                style={{ objectFit: "contain" }}
+              />
+
+            </>
           )}
 
           {isSegmenting && (
@@ -204,7 +243,7 @@ export function EditorCanvas({
             </div>
           )}
 
-          {!segmentMode && aiEditStatus !== "preview" && detections.map((det) => (
+          {aiEditStatus !== "preview" && detections.map((det) => (
             <BoundingBox
               key={det.id}
               detection={det}

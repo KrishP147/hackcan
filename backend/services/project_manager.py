@@ -23,6 +23,7 @@ def create_project() -> dict:
     (project_dir / "frames").mkdir(exist_ok=True)
     (project_dir / "masks").mkdir(exist_ok=True)
     (project_dir / "edited").mkdir(exist_ok=True)
+    (project_dir / "backups").mkdir(exist_ok=True)
 
     _write_status(project_id, {
         "status": "created",

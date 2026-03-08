@@ -189,14 +189,33 @@ async def apply_drop_shadow(frame_public_id: str) -> str:
     return url
 
 
-async def apply_generative_recolor(frame_public_id: str, prompt: str, color: str) -> str:
-    """Generative recolor — recolor a specific object identified by prompt."""
-    url = cloudinary.CloudinaryImage(frame_public_id).build_url(
-        transformation=[
-            {"effect": f"gen_recolor:prompt_{_safe(prompt)};to-color_{color}"},
-        ],
-        secure=True,
-    )
+async def apply_generative_recolor(frame_public_id: str, prompt: str, color: str, mask_public_id: str = "") -> str:
+    """Generative recolor — recolor a specific object identified by prompt or mask."""
+    # If mask is provided, use it as overlay for targeted recolor
+    if mask_public_id:
+        # Use mask overlay with gen_recolor
+        mask_overlay = mask_public_id.replace("/", ":")
+        url = cloudinary.CloudinaryImage(frame_public_id).build_url(
+            transformation=[
+                {
+                    "overlay": mask_overlay,
+                    "flags": "region_relative",
+                },
+                {
+                    "effect": f"gen_recolor:to-color_{color}",
+                    "flags": "layer_apply",
+                },
+            ],
+            secure=True,
+        )
+    else:
+        # Fallback to prompt-based recolor
+        url = cloudinary.CloudinaryImage(frame_public_id).build_url(
+            transformation=[
+                {"effect": f"gen_recolor:prompt_{_safe(prompt)};to-color_{color}"},
+            ],
+            secure=True,
+        )
     return url
 
 

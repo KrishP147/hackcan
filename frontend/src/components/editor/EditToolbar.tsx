@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useRef } from "react";
 import {
   Palette,
   Maximize2,
@@ -13,7 +13,9 @@ import {
   ArrowUpCircle,
   WandSparkles,
   Droplets,
-  X,
+  Film,
+  Undo2,
+  Loader2,
 } from "lucide-react";
 
 export type EditAction =
@@ -62,26 +64,44 @@ const COLOR_PRESETS = [
 interface EditToolbarProps {
   objectLabel: string;
   active: boolean;
+  hasMask: boolean;
+  editApplied: boolean;
+  isRefining?: boolean;
   onApply: (action: EditAction, params: { color?: string; prompt?: string; scale?: number }) => void;
+  onRefine: () => void;
+  onPropagate: (prompt: string) => void;
+  onUndo: () => void;
   onClose: () => void;
 }
 
-export function EditToolbar({ objectLabel, active, onApply, onClose }: EditToolbarProps) {
+export function EditToolbar({ objectLabel, active, hasMask, editApplied, isRefining = false, onApply, onRefine, onPropagate, onUndo, onClose }: EditToolbarProps) {
   const [selected, setSelected] = useState<EditOption | null>(null);
   const [color, setColor] = useState("#F43F5E");
   const [prompt, setPrompt] = useState("");
   const [scale, setScale] = useState(1.5);
+  const promptInputRef = useRef<HTMLInputElement>(null);
 
   const objectEdits = EDIT_OPTIONS.filter((o) => o.category === "object");
   const frameEdits = EDIT_OPTIONS.filter((o) => o.category === "frame");
 
   const handleApply = () => {
     if (!selected || !active) return;
+    if (selected.category === "object" && !hasMask) return;
+    
+    // Read prompt directly from input to avoid stale state
+    const currentPrompt = selected.needsPrompt && promptInputRef.current
+      ? promptInputRef.current.value
+      : prompt;
+    
     onApply(selected.id, {
       color: selected.needsColor ? color.replace("#", "") : undefined,
-      prompt: selected.needsPrompt ? prompt : undefined,
+      prompt: selected.needsPrompt ? currentPrompt : undefined,
       scale: selected.needsScale ? scale : undefined,
     });
+    
+    // Reset selection after applying
+    setSelected(null);
+    setPrompt("");
   };
 
   return (
@@ -90,54 +110,39 @@ export function EditToolbar({ objectLabel, active, onApply, onClose }: EditToolb
       style={{ background: "var(--ed-surface)", borderColor: "var(--ed-border)" }}
       onClick={(e) => e.stopPropagation()}
     >
-      {/* Header */}
-      <div
-        className="flex items-center justify-between px-4 py-3 border-b"
-        style={{ borderColor: "var(--ed-surface-2)" }}
-      >
-        <div className="flex items-center gap-2">
-          <div
-            className="w-1.5 h-1.5 rounded-full transition-colors"
-            style={{ background: active ? "var(--accent)" : "var(--ed-icon-dim)" }}
-          />
-          <span
-            className="text-sm font-medium transition-colors"
-            style={{ color: active ? "var(--ed-text)" : "var(--ed-subtle)" }}
-          >
-            {active ? objectLabel : "selection"}
-          </span>
-        </div>
-        {/* no close button */}
-      </div>
+
 
       {!selected ? (
         <div className="p-3 flex-1">
           <p
             className="text-[10px] uppercase tracking-widest font-semibold mb-2 px-1"
-            style={{ color: active ? "var(--ed-icon-dim)" : "var(--ed-disabled)" }}
+            style={{ color: (active && hasMask) ? "var(--ed-icon-dim)" : "var(--ed-disabled)" }}
           >
-            Object
+            Object {!hasMask && active && <span className="normal-case tracking-normal font-normal">(segment first)</span>}
           </p>
           <div className="grid grid-cols-3 gap-1 mb-4">
             {objectEdits.map((opt) => {
               const Icon = opt.icon;
+              const enabled = active && hasMask;
               return (
                 <button
                   key={opt.id}
-                  disabled={!active}
+                  disabled={!enabled}
                   onClick={() => {
                     if (!opt.needsColor && !opt.needsPrompt && !opt.needsScale) {
                       onApply(opt.id, {});
                     } else {
                       setSelected(opt);
+                      // Reset prompt when selecting a new option
+                      setPrompt("");
                     }
                   }}
                   className="flex flex-col items-center gap-1.5 py-2.5 px-1 rounded-xl transition-all"
                   style={{
-                    color: active ? "var(--ed-icon)" : "var(--ed-disabled)",
-                    cursor: active ? "pointer" : "not-allowed",
+                    color: enabled ? "var(--ed-icon)" : "var(--ed-disabled)",
+                    cursor: enabled ? "pointer" : "not-allowed",
                   }}
-                  onMouseEnter={(e) => active && (e.currentTarget.style.background = "var(--ed-hover)")}
+                  onMouseEnter={(e) => enabled && (e.currentTarget.style.background = "var(--ed-hover)")}
                   onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
                 >
                   <Icon className="w-4 h-4" strokeWidth={1.5} />
@@ -165,6 +170,8 @@ export function EditToolbar({ objectLabel, active, onApply, onClose }: EditToolb
                       onApply(opt.id, {});
                     } else {
                       setSelected(opt);
+                      // Reset prompt when selecting a new option
+                      setPrompt("");
                     }
                   }}
                   className="flex flex-col items-center gap-1.5 py-2.5 px-1 rounded-xl transition-all"
@@ -181,6 +188,73 @@ export function EditToolbar({ objectLabel, active, onApply, onClose }: EditToolb
               );
             })}
           </div>
+
+          <>
+            <div className="my-3 border-t" style={{ borderColor: "var(--ed-border)" }} />
+            <p
+              className="text-[10px] uppercase tracking-widest font-semibold mb-2 px-1"
+              style={{ color: "var(--ed-icon-dim)" }}
+            >
+              AI Enhance
+            </p>
+            <button
+              onClick={onRefine}
+              disabled={isRefining}
+              className="flex items-center gap-2 w-full py-2.5 px-3 rounded-xl text-xs font-semibold transition-all border mb-2 disabled:opacity-50 disabled:cursor-not-allowed"
+              style={{
+                background: "var(--accent)",
+                color: "#fff",
+                borderColor: "transparent",
+                boxShadow: "0 4px 16px rgba(244,63,94,0.25)",
+              }}
+              onMouseEnter={(e) => !isRefining && (e.currentTarget.style.opacity = "0.9")}
+              onMouseLeave={(e) => (e.currentTarget.style.opacity = "1")}
+            >
+              {isRefining ? <Loader2 className="w-4 h-4 animate-spin" strokeWidth={1.5} /> : null}
+              {isRefining ? "Making Realistic..." : "Make Realistic"}
+            </button>
+            {editApplied && (
+              <button
+                onClick={onUndo}
+                className="flex items-center gap-2 w-full py-2 px-3 rounded-xl text-xs font-medium transition-all border mb-2"
+                style={{
+                  background: "transparent",
+                  color: "var(--ed-text)",
+                  borderColor: "var(--ed-border)",
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background = "var(--ed-surface-2)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = "transparent";
+                }}
+              >
+                <Undo2 className="w-4 h-4" strokeWidth={1.5} />
+                Undo Change
+              </button>
+            )}
+          </>
+          {editApplied && (
+            <>
+              <button
+                onClick={() => {
+                  const desc = prompt || "Apply the same visual edit consistently";
+                  onPropagate(desc);
+                }}
+                className="flex items-center gap-2 w-full py-2.5 px-3 rounded-xl text-xs font-semibold transition-all border"
+                style={{
+                  background: "linear-gradient(135deg, var(--accent), #8B5CF6)",
+                  color: "#fff",
+                  borderColor: "transparent",
+                  boxShadow: "0 4px 16px rgba(139,92,246,0.3)",
+                }}
+                onMouseEnter={(e) => (e.currentTarget.style.opacity = "0.9")}
+                onMouseLeave={(e) => (e.currentTarget.style.opacity = "1")}
+              >
+                Propagate to All Frames
+              </button>
+            </>
+          )}
         </div>
       ) : (
         <div className="p-4 space-y-4 flex-1">
@@ -238,6 +312,7 @@ export function EditToolbar({ objectLabel, active, onApply, onClose }: EditToolb
                 {selected.id === "replace" ? "Replace with…" : selected.id === "bg_replace" ? "New background…" : "Describe…"}
               </p>
               <input
+                ref={promptInputRef}
                 type="text"
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}

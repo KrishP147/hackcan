@@ -3,7 +3,12 @@
     "allow": [
       "Bash(curl:*)",
       "Bash(cp:*)",
-      "Bash(ffmpeg:*)"
+      "Bash(ffmpeg:*)",
+      "Bash(grep:*)",
+      "Bash(npx tsc:*)",
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(xxd:*)"
     ]
   }
 }
