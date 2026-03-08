@@ -280,7 +280,7 @@ export function EditToolbar({ objectLabel, active, hasMask, editApplied, isRefin
           {selected.needsPrompt && (
             <div>
               <p className="text-xs mb-2" style={{ color: "var(--ed-subtle)" }}>
-                {selected.id === "replace" ? "Replace with…" : selected.id === "bg_replace" ? "New background…" : "Describe…"}
+                {selected.id === "bg_replace" ? "New background…" : "Describe…"}
               </p>
               <input
                 ref={promptInputRef}
@@ -288,7 +288,6 @@ export function EditToolbar({ objectLabel, active, hasMask, editApplied, isRefin
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
                 placeholder={
-                  selected.id === "replace" ? "e.g. a red sports car" :
                   selected.id === "bg_replace" ? "e.g. sunset beach" :
                   "Describe what you want…"
                 }
