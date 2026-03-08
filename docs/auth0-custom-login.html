@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FrameShift — Sign in</title>
+  <script src="https://cdn.auth0.com/js/lock/12.x/auth0-lock.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0d0d0d;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      padding: 24px;
+    }
+
+    /* Ambient glow behind the card */
+    body::before {
+      content: "";
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 600px;
+      height: 600px;
+      background: radial-gradient(circle, rgba(244,63,94,0.08) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    /* ── Lock container overrides ── */
+    #lock-container {
+      width: 100%;
+      max-width: 400px;
+    }
+
+    /* Card */
+    .auth0-lock.auth0-lock {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+    }
+
+    .auth0-lock.auth0-lock .auth0-lock-widget {
+      border-radius: 20px !important;
+      overflow: hidden !important;
+      box-shadow: 0 32px 80px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.06) !important;
+    }
+
+    /* Header */
+    .auth0-lock.auth0-lock .auth0-lock-header {
+      background: #111827 !important;
+      padding: 28px 24px 20px !important;
+      border-bottom: 1px solid rgba(255,255,255,0.06) !important;
+    }
+
+    .auth0-lock.auth0-lock .auth0-lock-header-bg {
+      background: #111827 !important;
+    }
+
+    .auth0-lock.auth0-lock .auth0-lock-header-bg-blur {
+      display: none !important;
+    }
+
+    .auth0-lock.auth0-lock .auth0-lock-name {
+      color: #ffffff !important;
+      font-size: 20px !important;
+      font-weight: 600 !important;
+      letter-spacing: -0.01em !important;
+    }
+
+    .auth0-lock.auth0-lock .auth0-lock-header-logo {
+      width: 44px !important;
+      height: 44px !important;
+      border-radius: 12px !important;
+    }
+
+    /* Body */
+    .auth0-lock.auth0-lock .auth0-lock-body-content {
+      background: #111827 !important;
+      padding: 24px !important;
+    }
+
+    .auth0-lock.auth0-lock .auth0-lock-content {
+      background: #111827 !important;
+    }
+
+    .auth0-lock.auth0-lock .auth0-lock-content-body-wrapper {
+      background: #111827 !important;
+    }
+
+    /* Inputs */
+    .auth0-lock.auth0-lock .auth0-lock-input-wrap {
+      background: #1f2937 !important;
+      border: 1px solid rgba(255,255,255,0.08) !important;
+      border-radius: 12px !important;
+      transition: border-color 200ms !important;
+    }
+
+    .auth0-lock.auth0-lock .auth0-lock-input-wrap:focus-within {
+      border-color: #F43F5E !important;
+    }
+
+    .auth0-lock.auth0-lock .auth0-lock-input {
+      background: transparent !important;
+      color: #f9fafb !important;
+      font-size: 14px !important;
+    }
+
+    .auth0-lock.auth0-lock .auth0-lock-input::placeholder {
+      color: #6b7280 !important;
+    }
+
+    .auth0-lock.auth0-lock .auth0-lock-input-wrap .auth0-lock-icon {
+      fill: #6b7280 !important;
+    }
+
+    /* Submit button */
+    .auth0-lock.auth0-lock .auth0-lock-submit {
+      background: #F43F5E !important;
+      background-image: none !important;
+      border-radius: 12px !important;
+      height: 44px !important;
+      font-size: 15px !important;
+      font-weight: 600 !important;
+      letter-spacing: 0.01em !important;
+      transition: background 200ms, transform 100ms !important;
+      box-shadow: none !important;
+    }
+
+    .auth0-lock.auth0-lock .auth0-lock-submit:hover {
+      background: #E11D48 !important;
+      transform: scale(1.01) !important;
+    }
+
+    .auth0-lock.auth0-lock .auth0-lock-submit:active {
+      transform: scale(0.98) !important;
+    }
+
+    .auth0-lock.auth0-lock .auth0-lock-submit span {
+      font-size: 15px !important;
+      font-weight: 600 !important;
+    }
+
+    /* Social buttons */
+    .auth0-lock.auth0-lock .auth0-lock-social-button {
+      background: #1f2937 !important;
+      border: 1px solid rgba(255,255,255,0.08) !important;
+      border-radius: 12px !important;
+      height: 44px !important;
+      transition: background 200ms, border-color 200ms !important;
+    }
+
+    .auth0-lock.auth0-lock .auth0-lock-social-button:hover {
+      background: #374151 !important;
+      border-color: rgba(255,255,255,0.15) !important;
+    }
+
+    .auth0-lock.auth0-lock .auth0-lock-social-button-text {
+      color: #f9fafb !important;
+      font-size: 14px !important;
+      font-weight: 500 !important;
+    }
+
+    /* Divider "OR" */
+    .auth0-lock.auth0-lock .auth0-lock-alternative {
+      color: #6b7280 !important;
+    }
+
+    .auth0-lock.auth0-lock .auth0-lock-alternative-link {
+      color: #F43F5E !important;
+      font-weight: 500 !important;
+    }
+
+    .auth0-lock.auth0-lock .auth0-lock-alternative-link:hover {
+      color: #fb7185 !important;
+    }
+
+    /* "Don't have an account?" / "Sign up" links */
+    .auth0-lock.auth0-lock .auth0-lock-tabs li.auth0-lock-tabs-current a {
+      color: #F43F5E !important;
+      border-bottom: 2px solid #F43F5E !important;
+    }
+
+    .auth0-lock.auth0-lock .auth0-lock-tabs li a {
+      color: #6b7280 !important;
+    }
+
+    /* Error messages */
+    .auth0-lock.auth0-lock .auth0-global-message.auth0-global-message-error {
+      background: rgba(220,38,38,0.15) !important;
+      color: #fca5a5 !important;
+      border-radius: 8px !important;
+    }
+
+    /* Separator line */
+    .auth0-lock.auth0-lock .auth0-lock-pane-separator {
+      background: rgba(255,255,255,0.06) !important;
+    }
+
+    /* Footer */
+    .auth0-lock.auth0-lock .auth0-lock-footer {
+      background: #111827 !important;
+      border-top: 1px solid rgba(255,255,255,0.06) !important;
+    }
+
+    .auth0-lock.auth0-lock .auth0-lock-footer-fetchingInfo,
+    .auth0-lock.auth0-lock .auth0-lock-terms {
+      color: #6b7280 !important;
+      font-size: 12px !important;
+    }
+
+    /* Checkbox */
+    .auth0-lock.auth0-lock .auth0-lock-checkbox-label {
+      color: #9ca3af !important;
+    }
+
+    /* Forgot password link */
+    .auth0-lock.auth0-lock a.auth0-lock-alternative-link {
+      color: #F43F5E !important;
+    }
+
+    /* Loading spinner */
+    .auth0-lock.auth0-lock .auth0-loading-screen {
+      background: #111827 !important;
+    }
+
+    .auth0-lock.auth0-lock .auth0-loading {
+      border-color: rgba(244,63,94,0.2) !important;
+      border-top-color: #F43F5E !important;
+    }
+
+    /* "Powered by Auth0" badge */
+    .auth0-lock.auth0-lock .auth0-lock-badge-bottom {
+      display: none !important;
+    }
+  </style>
+</head>
+<body>
+  <div id="lock-container"></div>
+
+  <script>
+    var config = JSON.parse(decodeURIComponent(escape(window.atob('@@config@@'))));
+
+    var params = Object.assign(
+      { scope: "openid profile email" },
+      config.internalOptions
+    );
+
+    var lock = new Auth0Lock(config.clientID, config.auth0Domain, {
+      container: "lock-container",
+      auth: {
+        redirectUrl: config.callbackURL,
+        responseType:
+          (config.internalOptions || {}).response_type ||
+          (config.callbackOnLocationHash ? "token" : "code"),
+        params: params,
+      },
+      languageDictionary: {
+        title: "FrameShift",
+        signUpTitle: "FrameShift",
+        loginLabel: "Sign in",
+        signUpLabel: "Sign up",
+        emailInputPlaceholder: "Email address",
+        passwordInputPlaceholder: "Password",
+        submitLabel: "Continue",
+        forgotPasswordAction: "Forgot password?",
+        dontHaveAnAccountAction: "Don't have an account?",
+        alreadyHaveAnAccountAction: "Already have an account?",
+        loginAtLabel: "Sign in",
+        signUpAtLabel: "Sign up",
+      },
+      theme: {
+        logo: "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNDQiIGhlaWdodD0iNDQiIHZpZXdCb3g9IjAgMCA0NCA0NCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cmVjdCB3aWR0aD0iNDQiIGhlaWdodD0iNDQiIHJ4PSIxMiIgZmlsbD0iIzExMTgyNyIvPjxwb2x5Z29uIHBvaW50cz0iMTYsMTIgMzIsMjIgMTYsMzIiIGZpbGw9IiNGNDNGNUUiLz48L3N2Zz4=",
+        primaryColor: "#F43F5E",
+      },
+      avatar: null,
+      allowedConnections: ["Username-Password-Authentication", "google-oauth2"],
+      rememberLastLogin: true,
+      closable: false,
+    });
+
+    lock.show();
+  </script>
+</body>
+</html>
