@@ -39,7 +39,8 @@ export default function EditorPage() {
   const playIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [isDark, setIsDark] = useState(false);
 
-  // Playback loop
+  // Playback loop — 15 fps so frames have time to load
+  const playbackFps = 15;
   useEffect(() => {
     if (editor.isPlaying && editor.videoLoaded) {
       playIntervalRef.current = setInterval(() => {
@@ -48,12 +49,12 @@ export default function EditorPage() {
             ? 0
             : editor.currentFrame + 1
         );
-      }, 1000 / editor.fps);
+      }, 1000 / playbackFps);
     }
     return () => {
       if (playIntervalRef.current) clearInterval(playIntervalRef.current);
     };
-  }, [editor.isPlaying, editor.videoLoaded, editor.currentFrame, editor.fps, editor.frames.length, editor.setCurrentFrame]);
+  }, [editor.isPlaying, editor.videoLoaded, editor.currentFrame, editor.frames.length, editor.setCurrentFrame]);
 
   // Keyboard shortcuts
   useEffect(() => {
