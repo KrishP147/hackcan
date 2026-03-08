@@ -192,6 +192,7 @@ export function EditorTimeline({
                       e.preventDefault();
                       e.stopPropagation();
                       if (!trackRef.current || !onMarkerDrag) return;
+                      const markerEl = e.currentTarget as HTMLElement;
 
                       const onMove = (ev: PointerEvent) => {
                         if (!trackRef.current) return;
@@ -199,7 +200,6 @@ export function EditorTimeline({
                         const pct = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
                         const newFrame = Math.round(pct * (totalFrames - 1));
                         // Update visual position during drag
-                        const markerEl = e.currentTarget;
                         const newPct = totalFrames > 0 ? (newFrame / Math.max(totalFrames - 1, 1)) * 100 : 0;
                         markerEl.style.left = `calc(${newPct}% - 4px)`;
                       };

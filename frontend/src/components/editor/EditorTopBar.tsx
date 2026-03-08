@@ -59,7 +59,7 @@ export function EditorTopBar({
       {/* Left: Back + name */}
       <div className="flex items-center gap-3">
         <a
-          href="/"
+          href="/dashboard"
           className="flex items-center gap-2 transition-opacity hover:opacity-70"
           style={{ color: "var(--ed-icon)" }}
         >
