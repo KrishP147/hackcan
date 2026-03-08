@@ -23,6 +23,8 @@ function formatDate(iso: string) {
 export function ProjectCard({ project, onDelete }: { project: Project; onDelete: (id: string) => void }) {
   const router = useRouter();
   const [deleting, setDeleting] = useState(false);
+  const [thumbnailUrl, setThumbnailUrl] = useState(project.thumbnail_url ?? "");
+  const [settingThumbnail, setSettingThumbnail] = useState(false);
   const status = STATUS_STYLES[project.status] ?? STATUS_STYLES.created;
 
   async function handleDelete(e: React.MouseEvent) {
@@ -33,6 +35,29 @@ export function ProjectCard({ project, onDelete }: { project: Project; onDelete:
     onDelete(project.project_id);
   }
 
+  async function handleSetThumbnail(e: React.MouseEvent) {
+    e.stopPropagation();
+    if (settingThumbnail) return;
+    setSettingThumbnail(true);
+    try {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/project/${project.project_id}/status`);
+      if (!res.ok) return;
+      const { frame_count, status: projectStatus } = await res.json();
+      if (!frame_count || !["ready", "done"].includes(projectStatus)) return;
+      const url = `${process.env.NEXT_PUBLIC_API_URL}/frame/${project.project_id}/${Math.floor(Math.random() * frame_count)}`;
+      setThumbnailUrl(url);
+      await fetch(`/api/projects/${project.project_id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ thumbnail_url: url }),
+      });
+    } catch {
+      // silently fail
+    } finally {
+      setSettingThumbnail(false);
+    }
+  }
+
   return (
     <div className="group relative bg-white border border-[#E5E7EB] rounded-2xl overflow-hidden hover:border-[#F43F5E] hover:shadow-md transition-all duration-300 hover:-translate-y-1 cursor-pointer">
       {/* Thumbnail */}
@@ -40,9 +65,9 @@ export function ProjectCard({ project, onDelete }: { project: Project; onDelete:
         className="aspect-video bg-[#111827] flex items-center justify-center relative"
         onClick={() => router.push(`/editor/${project.project_id}?frame=${project.last_frame}`)}
       >
-        {project.thumbnail_url ? (
+        {thumbnailUrl ? (
           <img
-            src={project.thumbnail_url}
+            src={thumbnailUrl}
             alt={project.name}
             className="w-full h-full object-cover"
           />
@@ -66,6 +91,24 @@ export function ProjectCard({ project, onDelete }: { project: Project; onDelete:
           <p className="font-[550] text-[#171717] text-base leading-tight line-clamp-1 flex-1">
             {project.name}
           </p>
+          <button
+            onClick={handleSetThumbnail}
+            disabled={settingThumbnail}
+            className="opacity-0 group-hover:opacity-100 transition-opacity text-[#9CA3AF] hover:text-[#F43F5E] text-xs p-1 -mt-0.5 flex-shrink-0"
+            title="Set random thumbnail"
+          >
+            {settingThumbnail ? (
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="animate-spin">
+                <path d="M21 12a9 9 0 11-6.219-8.56" />
+              </svg>
+            ) : (
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <rect x="3" y="3" width="18" height="18" rx="2" />
+                <circle cx="8.5" cy="8.5" r="1.5" />
+                <polyline points="21 15 16 10 5 21" />
+              </svg>
+            )}
+          </button>
           <button
             onClick={handleDelete}
             disabled={deleting}
