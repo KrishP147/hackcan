@@ -1,6 +1,6 @@
 # FrameShift AI
 
-By Justin Wang, Bryan Lin, Daniel Zhao, and Krish Punjabi.
+By Bryan Lin, Justin Wang, Daniel Zhao, and Krish Punjabi.
 
 AI-powered video editor. Upload a video, click an object, apply edits — changes propagate across every frame automatically.
 
