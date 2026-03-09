@@ -55,7 +55,7 @@ export function Footer() {
             <Play className="w-3.5 h-3.5 text-white ml-0.5" fill="white" />
           </div>
           <span className="text-lg font-[550] text-white tracking-tight">
-            ProductName
+            FrameShift
           </span>
         </div>
 

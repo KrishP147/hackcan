@@ -1,8 +1,8 @@
-# FrameShift AI
+# FrameShift
 
-By Justin Wang, Bryan Lin, Daniel Zhao, and Krish Punjabi.
+By Bryan Lin, Justin Wang, Daniel Zhao, and Krish Punjabi.
 
-AI-powered video editor. Upload a video, click an object, apply edits — changes propagate across every frame automatically.
+AI-powered video editor. Upload a video, click an object, apply edits — changes propagate across every frame automatically. **Cloudinary** is used for image and video storage and for per-frame transforms (including thumbnails).
 
 ## What it does
 
@@ -20,7 +20,7 @@ AI-powered video editor. Upload a video, click an object, apply edits — change
 | Backend | FastAPI, Python |
 | Object detection | YOLOv11 (Ultralytics) |
 | Segmentation | SAM 2 |
-| Storage & media | Cloudinary |
+| Storage & media | Cloudinary (image/video storage, transforms, thumbnails) |
 | Database | Supabase (Postgres) |
 | Frame processing | FFmpeg |
 
@@ -98,6 +98,42 @@ npm run dev
 ```
 
 App runs at `http://localhost:3000`.
+
+## Cloudinary (storage, transforms, thumbnails)
+
+FrameShift uses **Cloudinary** for image and video storage and for per-frame transforms (including thumbnails). Uploaded videos and extracted frames are stored in Cloudinary; the transformation pipeline applies edits via `CloudinaryImage.build_url()`. Thumbnails for the dashboard are generated and served from Cloudinary. All transformation URLs are built in the backend and results are downloaded locally before FFmpeg re-encodes the final video.
+
+### Edit types (object-aware, use SAM 2 mask)
+
+| Edit type | Cloudinary effect | Description |
+|---|---|---|
+| Recolor | `gen_recolor:prompt_<obj>;to-color_<hex>` | Recolor a specific object by prompt or mask |
+| Resize | Overlay crop + scale + `layer_apply` | Crop the object region and scale it in place |
+| Delete | `gen_remove` | AI-powered object removal |
+| Replace | `gen_replace:from_auto;to_<prompt>` | Swap object with AI-generated content from a text prompt |
+| Add | `gen_fill:prompt_<prompt>` with crop region | Generate and composite a new object at a specified region |
+
+### Additional AI effects
+
+| Effect | Cloudinary effect | Description |
+|---|---|---|
+| Background remove | `background_removal` | Remove background, keep foreground |
+| Background replace | `gen_background_replace:prompt_<prompt>` | Replace background with AI-generated scene |
+| Generative fill | `gen_fill` / `gen_fill:prompt_<prompt>` | Extend or fill regions with generative AI |
+| Blur (full frame) | `blur:<strength>` | Apply blur to the entire frame |
+| Blur (region) | Mask overlay + `blur:1000` + `layer_apply` | Blur only the masked region (faces, plates) |
+| Enhance | `enhance` | AI quality and detail improvement |
+| Upscale | `upscale` | AI resolution upscaling |
+| Restore | `gen_restore` | Fix compression artifacts and noise |
+| Drop shadow | `background_removal` → `dropshadow:50` | Remove background then add drop shadow to subject |
+
+### How it works
+
+```
+Frame JPEG → upload to Cloudinary → build transformation URL → download result → FFmpeg re-encode
+```
+
+Transformations are applied per frame across the selected frame range, then all processed frames are stitched back into a video and uploaded to Cloudinary for delivery.
 
 ## API Endpoints
 
