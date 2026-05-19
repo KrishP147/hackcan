@@ -709,11 +709,10 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
       setState((s) => {
         if (!s.projectId) return s;
 
-        // Mask edits (object edits) always target current frame only since SAM2 mask is single-frame
         const MASK_ACTIONS = new Set(["delete", "replace", "resize", "blur_region", "gen_recolor", "recolor"]);
         const isMaskEdit = MASK_ACTIONS.has(action);
-        const startFrame = isMaskEdit ? s.currentFrame + 1 : (s.editRangeStart > 0 ? s.editRangeStart + 1 : s.currentFrame + 1);
-        const endFrame = isMaskEdit ? s.currentFrame + 1 : (s.editRangeEnd > 0 ? s.editRangeEnd + 1 : s.currentFrame + 1);
+        const startFrame = s.editRangeStart > 0 ? s.editRangeStart + 1 : (isMaskEdit ? 1 : s.currentFrame + 1);
+        const endFrame = s.editRangeEnd > 0 ? s.editRangeEnd + 1 : (isMaskEdit ? s.frames.length : s.currentFrame + 1);
         const editRule: Record<string, unknown> = {
           edit_type: action,
           start_frame: startFrame,
