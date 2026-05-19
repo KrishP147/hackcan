@@ -6,12 +6,6 @@
   <strong>AI-powered video editing. Click an object, apply an edit, propagate across every frame.</strong>
 </p>
 
-<p align="center">
-  Built by <a href="https://github.com/KrishP147">Krish Punjabi</a>, Bryan Lin, Justin Wang, and Daniel Zhao.
-</p>
-
----
-
 ## Overview
 
 FrameShift lets you edit objects in video without frame-by-frame manual work. Upload a video, click any object, and apply edits like recolor, remove, resize, or replace — the changes automatically propagate across your entire clip.
