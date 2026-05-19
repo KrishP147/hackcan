@@ -26,7 +26,10 @@
       "Bash(./venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info)",
       "Bash(./venv/bin/python *)",
       "Bash(npm run *)",
-      "Bash(awk NR>=39 && NR<=46 {print NR\": \"$0} *)"
+      "Bash(awk NR>=39 && NR<=46 {print NR\": \"$0} *)",
+      "Read(//private/var/folders/s4/z615hzfd4f57w45m3s3v9t4c0000gn/T/frameshift/5c33287c/**)",
+      "Read(//private/var/folders/s4/z615hzfd4f57w45m3s3v9t4c0000gn/T/frameshift/5c33287c/frames/**)",
+      "Bash(ffprobe -v error -select_streams v:0 -show_entries stream=width,height,nb_frames -of default=noprint_wrappers=1 /tmp/bench_5s_1080p.mp4)"
     ]
   }
 }
