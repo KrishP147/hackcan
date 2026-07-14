@@ -4,9 +4,7 @@ import { EditorTopBar } from "@/components/editor/EditorTopBar";
 import { EditorCanvas } from "@/components/editor/EditorCanvas";
 import { EditorTimeline } from "@/components/editor/EditorTimeline";
 import { EditToolbar } from "@/components/editor/EditToolbar";
-import { AIChatPane } from "@/components/editor/AIChatPane";
 import { Toast } from "@/components/editor/Toast";
-import { AIProgressOverlay } from "@/components/editor/AIProgressOverlay";
 import { EditProgressOverlay } from "@/components/editor/EditProgressOverlay";
 import { useEditorState } from "@/hooks/useEditorState";
 import { useProjectSync } from "@/hooks/useProjectSync";
@@ -143,25 +141,8 @@ export default function EditorPage() {
           hasMask={editor.maskCount > 0}
           editApplied={editor.editVersion > 0}
           onApply={editor.applyEditAction}
-          onRefine={editor.refineFrame}
-          onPropagate={editor.propagateEdit}
           onUndo={editor.undoEdit}
           onClose={editor.closeEditPanel}
-          isRefining={editor.isRefining}
-        />
-
-        <AIChatPane
-          projectId={projectId}
-          currentFrame={editor.currentFrame}
-          videoLoaded={editor.videoLoaded}
-          chatHistory={editor.aiChatHistory}
-          previewFrameUrl={editor.aiPreviewFrameUrl}
-          isGenerating={editor.isAIGenerating}
-          aiEditStatus={editor.aiEditStatus}
-          onSendPrompt={editor.sendAIPrompt}
-          onAccept={editor.acceptAIGeneration}
-          onReject={editor.rejectAIGeneration}
-          onRetry={editor.retryAIGeneration}
         />
       </div>
 
@@ -188,15 +169,6 @@ export default function EditorPage() {
         message={editor.toastMessage}
         show={editor.showToast}
         onHide={editor.hideToast}
-      />
-
-      <AIProgressOverlay
-        show={editor.aiEditStatus === "applying"}
-        progress={editor.aiEditProgress}
-        interpolationProgress={editor.aiInterpolationProgress}
-        phase={editor.aiEditPhase}
-        status={editor.aiEditStatus}
-        onCancel={editor.cancelEdit}
       />
 
       <EditProgressOverlay

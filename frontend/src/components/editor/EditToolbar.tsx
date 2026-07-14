@@ -6,14 +6,11 @@ import {
   Maximize2,
   Trash2,
   EyeOff,
-  ImageOff,
   ImagePlus,
-  Sparkles,
-  ArrowUpCircle,
-  WandSparkles,
-  Film,
-  Undo2,
-  Loader2,
+  Move,
+  Droplet,
+  Sun,
+  RefreshCw,
 } from "lucide-react";
 
 export type EditAction =
@@ -21,11 +18,11 @@ export type EditAction =
   | "resize"
   | "delete"
   | "blur_region"
-  | "bg_remove"
+  | "move"
+  | "color_pop"
+  | "glow"
+  | "replace"
   | "bg_replace"
-  | "enhance"
-  | "upscale"
-  | "restore"
 
 interface EditOption {
   id: EditAction;
@@ -34,6 +31,7 @@ interface EditOption {
   needsColor?: boolean;
   needsPrompt?: boolean;
   needsScale?: boolean;
+  needsOffset?: boolean;
   category: "object" | "frame";
 }
 
@@ -42,11 +40,11 @@ const EDIT_OPTIONS: EditOption[] = [
   { id: "recolor", icon: Palette, label: "Recolor", needsColor: true, category: "object" },
   { id: "resize", icon: Maximize2, label: "Resize", needsScale: true, category: "object" },
   { id: "blur_region", icon: EyeOff, label: "Blur", category: "object" },
-  { id: "bg_remove", icon: ImageOff, label: "Remove BG", category: "frame" },
+  { id: "move", icon: Move, label: "Move", needsOffset: true, category: "object" },
+  { id: "color_pop", icon: Droplet, label: "Color Pop", category: "object" },
+  { id: "glow", icon: Sun, label: "Glow", category: "object" },
+  { id: "replace", icon: RefreshCw, label: "Replace", needsPrompt: true, category: "object" },
   { id: "bg_replace", icon: ImagePlus, label: "Replace BG", needsPrompt: true, category: "frame" },
-  { id: "enhance", icon: Sparkles, label: "Enhance", category: "frame" },
-  { id: "upscale", icon: ArrowUpCircle, label: "Upscale", category: "frame" },
-  { id: "restore", icon: WandSparkles, label: "Restore", category: "frame" },
 ];
 
 const COLOR_PRESETS = [
@@ -60,19 +58,18 @@ interface EditToolbarProps {
   active: boolean;
   hasMask: boolean;
   editApplied: boolean;
-  isRefining?: boolean;
-  onApply: (action: EditAction, params: { color?: string; prompt?: string; scale?: number }) => void;
-  onRefine: () => void;
-  onPropagate: (prompt: string) => void;
+  onApply: (action: EditAction, params: { color?: string; prompt?: string; scale?: number; dx?: number; dy?: number }) => void;
   onUndo: () => void;
   onClose: () => void;
 }
 
-export function EditToolbar({ objectLabel, active, hasMask, editApplied, isRefining = false, onApply, onRefine, onPropagate, onUndo, onClose }: EditToolbarProps) {
+export function EditToolbar({ objectLabel, active, hasMask, editApplied, onApply, onUndo, onClose }: EditToolbarProps) {
   const [selected, setSelected] = useState<EditOption | null>(null);
   const [color, setColor] = useState("#F43F5E");
   const [prompt, setPrompt] = useState("");
   const [scale, setScale] = useState(1.5);
+  const [dx, setDx] = useState(0);
+  const [dy, setDy] = useState(0);
   const promptInputRef = useRef<HTMLInputElement>(null);
 
   const objectEdits = EDIT_OPTIONS.filter((o) => o.category === "object");
@@ -91,6 +88,8 @@ export function EditToolbar({ objectLabel, active, hasMask, editApplied, isRefin
       color: selected.needsColor ? color.replace("#", "") : undefined,
       prompt: selected.needsPrompt ? currentPrompt : undefined,
       scale: selected.needsScale ? scale : undefined,
+      dx: selected.needsOffset ? dx : undefined,
+      dy: selected.needsOffset ? dy : undefined,
     });
     
     // Reset selection after applying
@@ -183,49 +182,6 @@ export function EditToolbar({ objectLabel, active, hasMask, editApplied, isRefin
             })}
           </div>
 
-          <>
-            <div className="my-3 border-t" style={{ borderColor: "var(--ed-border)" }} />
-            <p
-              className="text-[10px] uppercase tracking-widest font-semibold mb-2 px-1"
-              style={{ color: "var(--ed-icon-dim)" }}
-            >
-              AI Enhance
-            </p>
-            <button
-              onClick={onRefine}
-              disabled={isRefining}
-              className="flex items-center gap-2 w-full py-2.5 px-3 rounded-xl text-xs font-semibold transition-all border mb-2 disabled:opacity-50 disabled:cursor-not-allowed"
-              style={{
-                background: "var(--accent)",
-                color: "#fff",
-                borderColor: "transparent",
-                boxShadow: "0 4px 16px rgba(244,63,94,0.25)",
-              }}
-              onMouseEnter={(e) => !isRefining && (e.currentTarget.style.opacity = "0.9")}
-              onMouseLeave={(e) => (e.currentTarget.style.opacity = "1")}
-            >
-              {isRefining ? <Loader2 className="w-4 h-4 animate-spin" strokeWidth={1.5} /> : null}
-              {isRefining ? "Making Realistic..." : "Make Realistic"}
-            </button>
-
-          </>
-          <button
-            onClick={() => {
-              const desc = prompt || "Apply the same visual edit consistently";
-              onPropagate(desc);
-            }}
-            className="flex items-center gap-2 w-full py-2.5 px-3 rounded-xl text-xs font-semibold transition-all border mt-2"
-            style={{
-              background: "var(--accent)",
-              color: "#fff",
-              borderColor: "transparent",
-              boxShadow: "0 4px 16px rgba(244,63,94,0.25)",
-            }}
-            onMouseEnter={(e) => (e.currentTarget.style.opacity = "0.9")}
-            onMouseLeave={(e) => (e.currentTarget.style.opacity = "1")}
-          >
-            Propagate to All Frames
-          </button>
         </div>
       ) : (
         <div className="p-4 space-y-4 flex-1">
@@ -300,6 +256,35 @@ export function EditToolbar({ objectLabel, active, hasMask, editApplied, isRefin
                 autoFocus
                 onKeyDown={(e) => e.key === "Enter" && handleApply()}
               />
+            </div>
+          )}
+
+          {selected.needsOffset && (
+            <div className="space-y-3">
+              <div>
+                <div className="flex justify-between mb-2">
+                  <p className="text-xs" style={{ color: "var(--ed-subtle)" }}>Horizontal</p>
+                  <p className="text-xs font-mono" style={{ color: "var(--ed-muted)" }}>{dx}px</p>
+                </div>
+                <input
+                  type="range" min="-300" max="300" step="5"
+                  value={dx}
+                  onChange={(e) => setDx(parseInt(e.target.value, 10))}
+                  className="w-full accent-[var(--accent)]"
+                />
+              </div>
+              <div>
+                <div className="flex justify-between mb-2">
+                  <p className="text-xs" style={{ color: "var(--ed-subtle)" }}>Vertical</p>
+                  <p className="text-xs font-mono" style={{ color: "var(--ed-muted)" }}>{dy}px</p>
+                </div>
+                <input
+                  type="range" min="-300" max="300" step="5"
+                  value={dy}
+                  onChange={(e) => setDy(parseInt(e.target.value, 10))}
+                  className="w-full accent-[var(--accent)]"
+                />
+              </div>
             </div>
           )}
 
