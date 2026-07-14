@@ -150,28 +150,7 @@ def apply_remove(frame_path: Path, mask_path: Path) -> None:
     result = cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB)
     Image.fromarray(result).save(str(frame_path), quality=95)
 
-def apply_enhance(frame_path: Path) -> None:
-    """Enhance image quality."""
-    img = Image.open(frame_path).convert("RGB")
-    
-    # Apply enhancements
-    enhancer = ImageEnhance.Sharpness(img)
-    img = enhancer.enhance(1.2)
-    
-    enhancer = ImageEnhance.Contrast(img)
-    img = enhancer.enhance(1.1)
-    
-    enhancer = ImageEnhance.Color(img)
-    img = enhancer.enhance(1.05)
-    
-    img.save(str(frame_path), quality=95)
 
-def apply_upscale(frame_path: Path, scale: int = 2) -> None:
-    """Upscale image using LANCZOS resampling."""
-    img = Image.open(frame_path).convert("RGB")
-    width, height = img.size
-    upscaled = img.resize((width * scale, height * scale), Image.LANCZOS)
-    upscaled.save(str(frame_path), quality=95)
 
 def apply_blur(frame_path: Path, strength: int = 10) -> None:
     """Apply blur to entire frame."""
@@ -179,21 +158,36 @@ def apply_blur(frame_path: Path, strength: int = 10) -> None:
     blurred = img.filter(ImageFilter.GaussianBlur(radius=strength))
     blurred.save(str(frame_path), quality=95)
 
-def apply_restore(frame_path: Path) -> None:
-    """Restore image by reducing noise and enhancing."""
-    img = Image.open(frame_path).convert("RGB")
-    
-    # Convert to numpy for processing
-    img_array = np.array(img)
-    
-    # Apply denoising
-    img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-    denoised = cv2.fastNlMeansDenoisingColored(img_cv, None, 10, 10, 7, 21)
-    img_array = cv2.cvtColor(denoised, cv2.COLOR_BGR2RGB)
-    
-    # Enhance
-    img = Image.fromarray(img_array)
-    enhancer = ImageEnhance.Sharpness(img)
-    img = enhancer.enhance(1.1)
-    
-    img.save(str(frame_path), quality=95)
+
+def _feathered_alpha(mask_path: Path, target_shape: tuple, feather_px: int = 5) -> np.ndarray:
+    """Mask as float alpha in [0,1] with a Gaussian-feathered boundary."""
+    mask = _load_mask(mask_path, target_shape)
+    a = (mask > 128).astype(np.float32)
+    k = feather_px * 2 + 1
+    return cv2.GaussianBlur(a, (k, k), 0)
+
+def apply_color_pop(frame_path: Path, mask_path: Path) -> None:
+    """Object stays color, everything else goes grayscale (§5.1)."""
+    img = cv2.imread(str(frame_path))
+    a = _feathered_alpha(mask_path, img.shape)[..., None]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray3 = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR).astype(np.float32)
+    out = a * img.astype(np.float32) + (1 - a) * gray3
+    cv2.imwrite(str(frame_path), np.clip(out, 0, 255).astype(np.uint8),
+                [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+def apply_glow(frame_path: Path, mask_path: Path,
+               intensity: float = 0.6, radius: int = 21) -> None:
+    """Bloom halo (§5.1): additive glow in the object's brightened color,
+    carried by a blurred mask alpha so the falloff extends outside the mask."""
+    img = cv2.imread(str(frame_path)).astype(np.float32)
+    hard = (_load_mask(mask_path, img.shape) > 128).astype(np.float32)
+    if hard.sum() > 0:
+        mean_color = img[hard > 0].mean(axis=0)
+    else:
+        mean_color = np.array([255.0, 255.0, 255.0])
+    glow_color = 0.5 * mean_color + 0.5 * 255.0           # push toward white
+    halo_alpha = cv2.GaussianBlur(hard, (radius, radius), 0)
+    out = img + intensity * halo_alpha[..., None] * glow_color[None, None, :]
+    cv2.imwrite(str(frame_path), np.clip(out, 0, 255).astype(np.uint8),
+                [cv2.IMWRITE_JPEG_QUALITY, 95])

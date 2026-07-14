@@ -8,7 +8,6 @@ import {
   type FrameData,
   generateFrames,
 } from "@/lib/mock-data";
-import type { ChatMessage } from "@/components/editor/AIChatPane";
 import { useVideoStore } from "@/stores/videoStore";
 import { useChangeLogStore } from "@/stores/changeLogStore";
 
@@ -50,7 +49,6 @@ interface EditorState {
   showEditPanel: boolean;
   toastMessage: string;
   showToast: boolean;
-  aiChatHistory: ChatMessage[];
   aiPreviewFrameUrl: string | null;
   aiGenerationId: string | null;
   isAIGenerating: boolean;
@@ -104,7 +102,6 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
     showEditPanel: false,
     toastMessage: "",
     showToast: false,
-    aiChatHistory: [],
     aiPreviewFrameUrl: null,
     aiGenerationId: null,
     isAIGenerating: false,
@@ -705,11 +702,11 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
   }, []);
 
   const applyEditAction = useCallback(
-    (action: string, params: { color?: string; prompt?: string; scale?: number }) => {
+    (action: string, params: { color?: string; prompt?: string; scale?: number; dx?: number; dy?: number }) => {
       setState((s) => {
         if (!s.projectId) return s;
 
-        const MASK_ACTIONS = new Set(["delete", "replace", "resize", "blur_region", "gen_recolor", "recolor"]);
+        const MASK_ACTIONS = new Set(["delete", "replace", "resize", "blur_region", "recolor", "move", "color_pop", "glow"]);
         const isMaskEdit = MASK_ACTIONS.has(action);
         const startFrame = s.editRangeStart > 0 ? s.editRangeStart + 1 : (isMaskEdit ? 1 : s.currentFrame + 1);
         const endFrame = s.editRangeEnd > 0 ? s.editRangeEnd + 1 : (isMaskEdit ? s.frames.length : s.currentFrame + 1);
@@ -721,6 +718,8 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
         if (params.color) editRule.color = params.color;
         if (params.prompt) editRule.prompt = params.prompt;
         if (params.scale) editRule.scale = params.scale;
+        if (params.dx !== undefined) editRule.dx = params.dx;
+        if (params.dy !== undefined) editRule.dy = params.dy;
 
         // Log edit change
         const { addLog } = useChangeLogStore.getState();
@@ -771,92 +770,6 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
     [restartPolling]
   );
 
-  const refineFrame = useCallback(() => {
-    setState((s) => {
-      if (!s.projectId) return s;
-
-      // Use slider range if set, otherwise use current frame only
-      const startFrame = s.editRangeStart >= 0 ? s.editRangeStart + 1 : s.currentFrame + 1;
-      const endFrame = s.editRangeEnd > 0 ? s.editRangeEnd + 1 : s.currentFrame + 1;
-
-      // Log refine change
-      const { addLog } = useChangeLogStore.getState();
-      addLog(s.projectId, {
-        projectId: s.projectId,
-        type: "refine",
-        frameIndex: s.currentFrame,
-        data: {
-          prompt: "Make realistic",
-        },
-      });
-
-      // Add change marker for refine
-      const markerId = `marker_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-      const newMarker = {
-        id: markerId,
-        frame: s.currentFrame,
-        editType: "refine",
-        timestamp: Date.now(),
-      };
-
-      fetch(`${API_URL}/edit/refine`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          project_id: s.projectId,
-          frame_index: s.currentFrame + 1,
-          start_frame: startFrame,
-          end_frame: endFrame,
-        }),
-      }).then(() => {
-        restartPolling();
-      });
-
-      return {
-        ...s,
-        isProcessing: true,
-        changeMarkers: [...s.changeMarkers, newMarker],
-      };
-    });
-  }, [restartPolling]);
-
-  const propagateEdit = useCallback((prompt: string) => {
-    setState((s) => {
-      if (!s.projectId) return s;
-
-      // Get all change logs for this project
-      const { getLogs } = useChangeLogStore.getState();
-      const changeLogs = getLogs(s.projectId);
-
-      // Use slider range if set, otherwise use current frame only
-      const startFrame = s.editRangeStart >= 0 ? s.editRangeStart + 1 : s.currentFrame + 1;
-      const endFrame = s.editRangeEnd > 0 ? s.editRangeEnd + 1 : startFrame; // If no end set, only process start frame
-
-      fetch(`${API_URL}/edit/propagate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          project_id: s.projectId,
-          frame_index: s.currentFrame + 1,
-          prompt,
-          start_frame: startFrame,
-          end_frame: endFrame,
-          change_logs: changeLogs, // Send all logged changes
-        }),
-      }).then(() => {
-        restartPolling();
-      });
-
-      return {
-        ...s,
-        aiEditStatus: "applying",
-        aiEditPhase: "transforming",
-        aiEditProgress: { done: 0, total: 0 },
-        aiInterpolationProgress: { done: 0, total: 0 },
-      };
-    });
-  }, [restartPolling]);
-
   const handleMarkerDrag = useCallback((markerId: string, newFrame: number) => {
     setState((s) => {
       // Find the marker
@@ -872,42 +785,23 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
       const startFrame = newFrame;
       const endFrame = s.editRangeEnd > 0 ? s.editRangeEnd : s.frames.length - 1;
 
-      // Trigger propagation based on edit type
-      if (marker.editType === "refine") {
-        // For refine, propagate the realistic enhancement
-        fetch(`${API_URL}/edit/propagate`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            project_id: s.projectId,
-            frame_index: newFrame + 1,
-            prompt: "Apply the same realistic enhancement consistently",
-            start_frame: startFrame + 1,
-            end_frame: endFrame + 1,
-            interval: 8,
-          }),
-        }).then(() => {
-          restartPolling();
-        });
-      } else {
-        // For other edits, propagate the edit type
-        const editRule: Record<string, unknown> = {
-          edit_type: marker.editType,
-          start_frame: startFrame + 1,
-          end_frame: endFrame + 1,
-        };
+      // Re-apply the marker's edit over the new range
+      const editRule: Record<string, unknown> = {
+        edit_type: marker.editType,
+        start_frame: startFrame + 1,
+        end_frame: endFrame + 1,
+      };
 
-        fetch(`${API_URL}/edit`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            project_id: s.projectId,
-            edit_rules: [editRule],
-          }),
-        }).then(() => {
-          restartPolling();
-        });
-      }
+      fetch(`${API_URL}/edit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_id: s.projectId,
+          edit_rules: [editRule],
+        }),
+      }).then(() => {
+        restartPolling();
+      });
 
       return {
         ...s,
@@ -1007,208 +901,6 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
     setState((s) => ({ ...s, showToast: false }));
   }, []);
 
-  const sendAIPrompt = useCallback((prompt: string) => {
-    setState((s) => {
-      if (!s.projectId) return s;
-
-      // Add user message to chat history
-      const userMessage: ChatMessage = {
-        role: "user",
-        message: prompt,
-        timestamp: Date.now(),
-      };
-
-      setState((prev) => ({
-        ...prev,
-        aiChatHistory: [...prev.aiChatHistory, userMessage],
-        isAIGenerating: true,
-        aiEditStatus: "idle",
-      }));
-
-      // Call preview endpoint
-      fetch(`${API_URL}/ai/edit/preview`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          project_id: s.projectId,
-          frame_index: s.currentFrame + 1,
-          prompt: prompt,
-        }),
-      })
-        .then(async (res) => {
-          if (!res.ok) {
-            const errorData = await res.json().catch(() => ({ error: "Unknown error" }));
-            throw new Error(errorData.error || `HTTP ${res.status}`);
-          }
-          return res.json();
-        })
-        .then((data) => {
-          if (data.error) {
-            throw new Error(data.error);
-          }
-          const previewUrl = `${API_URL}${data.preview_url}`;
-          console.log("Preview URL:", previewUrl);
-          const assistantMessage: ChatMessage = {
-            role: "assistant",
-            message: "Preview generated! Review it in the canvas.",
-            timestamp: Date.now(),
-          };
-          acceptInProgressRef.current = false; // Reset so accept button works
-          setState((prev) => ({
-            ...prev,
-            aiChatHistory: [...prev.aiChatHistory, assistantMessage],
-            aiPreviewFrameUrl: previewUrl,
-            aiGenerationId: data.generation_id,
-            isAIGenerating: false,
-            aiEditStatus: "preview",
-          }));
-        })
-        .catch((err) => {
-          console.error("AI preview error:", err);
-          setState((prev) => ({
-            ...prev,
-            isAIGenerating: false,
-            aiEditStatus: "idle",
-            showToast: true,
-            toastMessage: `Failed to generate preview: ${err.message}`,
-          }));
-        });
-
-      return s;
-    });
-  }, []);
-
-  const acceptAIGeneration = useCallback(() => {
-    if (acceptInProgressRef.current) return;
-
-    setState((s) => {
-      if (!s.projectId || !s.aiGenerationId) return s;
-      if (s.aiEditStatus === "applying") return s;
-
-      acceptInProgressRef.current = true;
-      const generationId = s.aiGenerationId;
-      // Use slider range if set, otherwise use current frame only
-      const startFrame = s.editRangeStart >= 0 ? s.editRangeStart + 1 : s.currentFrame + 1;
-      const endFrame = s.editRangeEnd > 0 ? s.editRangeEnd + 1 : s.currentFrame + 1;
-      const interval = 8;
-
-      fetch(`${API_URL}/ai/edit/accept`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          project_id: s.projectId,
-          generation_id: generationId,
-          start_frame: startFrame,
-          end_frame: endFrame,
-          interval: interval,
-        }),
-      })
-        .then((res) => res.json())
-        .then((data) => {
-          if (data.error && data.status !== "processing") {
-            acceptInProgressRef.current = false;
-            setState((prev) => ({
-              ...prev,
-              aiEditStatus: "idle" as const,
-              showToast: true,
-              toastMessage: data.error,
-            }));
-          }
-          // Status is "processing" — polling will handle progress updates
-          restartPolling();
-        })
-        .catch((err) => {
-          acceptInProgressRef.current = false;
-          setState((prev) => ({
-            ...prev,
-            aiEditStatus: "idle" as const,
-            showToast: true,
-            toastMessage: `Failed to accept: ${err.message}`,
-          }));
-        });
-
-      return {
-        ...s,
-        aiEditStatus: "applying" as const,
-        aiPreviewFrameUrl: null,
-        aiGenerationId: null,
-        aiEditProgress: { done: 0, total: 0 },
-        aiEditPhase: "transforming" as const,
-        aiInterpolationProgress: { done: 0, total: 0 },
-      };
-    });
-  }, [restartPolling]);
-
-  const rejectAIGeneration = useCallback(() => {
-    setState((s) => {
-      if (!s.projectId || !s.aiGenerationId) return s;
-
-      fetch(`${API_URL}/ai/edit/reject`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          project_id: s.projectId,
-          generation_id: s.aiGenerationId,
-        }),
-      });
-
-      acceptInProgressRef.current = false;
-      return {
-        ...s,
-        aiPreviewFrameUrl: null,
-        aiGenerationId: null,
-        aiEditStatus: "idle",
-      };
-    });
-  }, []);
-
-  const retryAIGeneration = useCallback(() => {
-    setState((s) => {
-      if (!s.projectId || !s.aiGenerationId) return s;
-
-      setState((prev) => ({
-        ...prev,
-        isAIGenerating: true,
-      }));
-
-      fetch(`${API_URL}/ai/edit/retry`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          project_id: s.projectId,
-          generation_id: s.aiGenerationId,
-        }),
-      })
-        .then((res) => res.json())
-        .then((data) => {
-          const assistantMessage: ChatMessage = {
-            role: "assistant",
-            message: "Preview regenerated! Review it below.",
-            timestamp: Date.now(),
-          };
-          setState((prev) => ({
-            ...prev,
-            aiChatHistory: [...prev.aiChatHistory, assistantMessage],
-            aiPreviewFrameUrl: `${API_URL}${data.preview_url}`,
-            aiGenerationId: data.generation_id,
-            isAIGenerating: false,
-            aiEditStatus: "preview",
-          }));
-        })
-        .catch((err) => {
-          console.error("AI retry error:", err);
-          setState((prev) => ({
-            ...prev,
-            isAIGenerating: false,
-            showToast: true,
-            toastMessage: "Failed to retry generation",
-          }));
-        });
-
-      return s;
-    });
-  }, []);
-
   const selectedObject = useMemo(
     () => state.detections.find((d) => d.id === state.selectedObjectId) ?? null,
     [state.detections, state.selectedObjectId]
@@ -1267,8 +959,6 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
     applyEdit,
     cancelEdit,
     applyEditAction,
-    refineFrame,
-    propagateEdit,
     undoEdit,
     setCurrentFrame,
     togglePlay,
@@ -1278,10 +968,6 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
     closeEditPanel,
     setVideoName,
     hideToast,
-    sendAIPrompt,
-    acceptAIGeneration,
-    rejectAIGeneration,
-    retryAIGeneration,
     editProgress: state.editProgress,
     editStatus: state.editStatus,
     changeMarkers: state.changeMarkers,
