@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from io import BytesIO
 
-from services import cloudinary_service, project_manager, ffmpeg_service, yolo_service, sam2_service, gemini_service, rife_service, storage_service
+from services import cloudinary_service, project_manager, ffmpeg_service, sam2_service, gemini_service, rife_service, storage_service
 from services.auth_service import get_current_user
 # film_service  # FILM disabled - using RIFE instead
 

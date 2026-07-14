@@ -8,6 +8,7 @@ import { AIChatPane } from "@/components/editor/AIChatPane";
 import { Toast } from "@/components/editor/Toast";
 import { AIProgressOverlay } from "@/components/editor/AIProgressOverlay";
 import { EditProgressOverlay } from "@/components/editor/EditProgressOverlay";
+import { ExportProgressOverlay } from "@/components/editor/ExportProgressOverlay";
 import { useEditorState } from "@/hooks/useEditorState";
 import { useProjectSync } from "@/hooks/useProjectSync";
 import { useEffect, useRef, useState } from "react";
@@ -41,7 +42,6 @@ export default function EditorPage() {
   const lastFrameTimeRef = useRef<number>(0);
   const currentFrameRef = useRef(editor.currentFrame);
   const framesLengthRef = useRef(editor.frames.length);
-  const playIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [isDark, setIsDark] = useState(false);
 
   // Playback loop — 15 fps so frames have time to load
@@ -204,6 +204,11 @@ export default function EditorPage() {
         show={editor.isProcessing && (editor.editStatus === "uploading" || editor.editStatus === "editing")}
         progress={editor.editProgress}
         status={editor.editStatus}
+      />
+
+      <ExportProgressOverlay
+        show={editor.isExporting}
+        videoName={editor.videoName}
       />
     </div>
   );

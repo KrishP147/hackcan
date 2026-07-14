@@ -6,12 +6,6 @@
   <strong>AI-powered video editing. Click an object, apply an edit, propagate across every frame.</strong>
 </p>
 
-<p align="center">
-  Built by <a href="https://github.com/KrishP147">Krish Punjabi</a>, Bryan Lin, Justin Wang, and Daniel Zhao.
-</p>
-
----
-
 ## Overview
 
 FrameShift lets you edit objects in video without frame-by-frame manual work. Upload a video, click any object, and apply edits like recolor, remove, resize, or replace — the changes automatically propagate across your entire clip.
@@ -61,10 +55,13 @@ One click propagates your edit across the entire frame range. Preview the result
 
 | Layer | Tech |
 |---|---|
-| Frontend | Next.js 15, Tailwind CSS, Auth0 |
+| Frontend | Next.js, Tailwind CSS, Auth0 |
 | Backend | FastAPI, Python |
 | Object Detection | YOLOv11 (Ultralytics) |
-| Segmentation | SAM 2 |
+| Segmentation & Tracking | SAM 2 |
+| Generative Edits | Gemini (keyframes) |
+| Frame Interpolation | RIFE (FILM optional fallback) |
+| Inpainting / Local Edits | OpenCV (TELEA) |
 | Storage & Media | Cloudinary |
 | Database | Supabase (Postgres) |
 | Frame Processing | FFmpeg |
@@ -72,14 +69,18 @@ One click propagates your edit across the entire frame range. Preview the result
 ## Architecture
 
 ```
-Video Upload → FFmpeg Frame Extraction → YOLOv11 Detection
+Video Upload → Cloudinary Storage → FFmpeg Frame Extraction → YOLOv11 Detection
                                               ↓
-              Click Object → SAM 2 Segmentation + Tracking
+              Click Object → SAM 2 Segmentation + Mask Propagation
                                               ↓
-            Apply Edit → Cloudinary Transforms (per frame)
+        ┌─ Generative edits: Gemini keyframes (every 15th frame)
+        │       → mask-based alpha compositing → RIFE interpolates the gaps
+        └─ Local edits: OpenCV per frame (TELEA inpainting, recolor, blur, resize)
                                               ↓
               FFmpeg Re-encode → Final Video via Cloudinary
 ```
+
+For a deep dive into how each stage works (video codecs, SAM 2's memory mechanism, diffusion models, RIFE, TELEA, and where their assumptions conflict), see [docs/Technical-Overview.md](docs/Technical-Overview.md).
 
 ## Supported Edits
 

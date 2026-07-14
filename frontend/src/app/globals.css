@@ -159,6 +159,15 @@ body {
   animation: pulse-border 1.5s ease-in-out infinite;
 }
 
+@keyframes export-progress {
+  0% { transform: translateX(-120%); }
+  100% { transform: translateX(280%); }
+}
+
+.animate-export-progress {
+  animation: export-progress 1.4s ease-in-out infinite;
+}
+
 /* Stagger delays */
 .stagger-1 { animation-delay: 0.2s; }
 .stagger-2 { animation-delay: 0.4s; }
