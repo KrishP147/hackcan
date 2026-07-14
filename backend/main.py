@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from io import BytesIO
 
-from services import cloudinary_service, project_manager, ffmpeg_service, sam2_service, gemini_service, rife_service, storage_service
+from services import cloudinary_service, project_manager, ffmpeg_service, sam2_service, gemini_service, rife_service
 from services.auth_service import get_current_user
 # film_service  # FILM disabled - using RIFE instead
 
@@ -76,10 +76,16 @@ def _background_extract(project_id: str):
     video_path = project_dir / "original.mp4"
     frames_dir = project_dir / "frames"
 
-    # Extract frames
+    # Extract frames at native fps, 720p working resolution
     project_manager.update_status(project_id, status="extracting")
     try:
-        frame_count = ffmpeg_service.extract_frames(video_path, frames_dir)
+        info = ffmpeg_service.probe_video(video_path)
+        if info["duration"] > 15:
+            project_manager.update_status(
+                project_id, status="error",
+                error="Clip too long (max 15s)")
+            return
+        frame_count, used_fps = ffmpeg_service.extract_frames(video_path, frames_dir)
     except Exception as e:
         print(f"[extract] FFmpeg failed: {e}")
         project_manager.update_status(project_id, status="error", error=str(e))
@@ -93,17 +99,9 @@ def _background_extract(project_id: str):
 
     # Mark ready immediately so frontend can show frames via API
     project_manager.update_status(project_id, status="ready", frame_count=frame_count,
+                                   fps=used_fps,
                                    frame_width=frame_width, frame_height=frame_height,
                                    detecting=False, detections={})
-
-    # Upload frames to Supabase Storage for persistent access
-    try:
-        storage_base_url = storage_service.upload_frames(project_id, frames_dir)
-        if storage_base_url:
-            project_manager.update_status(project_id, storage_base_url=storage_base_url)
-            print(f"[extract] Frames uploaded to Supabase Storage: {storage_base_url}")
-    except Exception as e:
-        print(f"[extract] Supabase Storage upload failed (non-fatal): {e}")
 
     # YOLO detection disabled
     # # Run YOLO on all frames, updating detections progressively
@@ -1387,22 +1385,23 @@ async def render_video(req: RenderRequest):
     output_path = project_dir / "output.mp4"
 
     status = project_manager.get_status(req.project_id)
-    
+    fps = status.get("fps") or 30
+
     # Check if AI edits are done - use frames_dir, otherwise use edited_dir
     if status.get("ai_edit_status") == "done":
         # Use frames directory (contains AI-edited frames)
-        ffmpeg_service.encode_video(frames_dir, output_path)
+        ffmpeg_service.encode_video(frames_dir, output_path, fps=fps)
     else:
         # Check if regular edits are done
         if status.get("edit_status") not in ("done", None, "idle"):
             return {"error": f"Edit not complete. Current edit_status: {status.get('edit_status')}"}
-        
+
         edited_frames = sorted(edited_dir.glob("frame_*.jpg"))
         if len(edited_frames) == 0:
             # No edits - use original frames
-            ffmpeg_service.encode_video(frames_dir, output_path)
+            ffmpeg_service.encode_video(frames_dir, output_path, fps=fps)
         else:
-            ffmpeg_service.encode_video(edited_dir, output_path)
+            ffmpeg_service.encode_video(edited_dir, output_path, fps=fps)
 
     # Return local file path
     return {
