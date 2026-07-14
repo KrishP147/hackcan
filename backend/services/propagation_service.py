@@ -1,0 +1,81 @@
+"""Backend A star-warp propagation (Doc 1 §2). Carry ONE appearance:
+compose pairwise flow into a single A→t displacement, sample the pristine
+anchor edit layer exactly once per target frame — nothing to morph between."""
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from services import flow_service
+
+
+@dataclass
+class EditLayer:
+    rgb: np.ndarray        # (H,W,3) uint8
+    alpha: np.ndarray      # (H,W) float32 [0,1]
+    validity: np.ndarray   # (H,W) float32 [0,1]
+
+
+def make_anchor_layer(edited_frame: np.ndarray, mask_alpha: np.ndarray) -> EditLayer:
+    return EditLayer(rgb=edited_frame.copy(),
+                     alpha=mask_alpha.astype(np.float32).copy(),
+                     validity=(mask_alpha > 0).astype(np.float32))
+
+
+def _compose_chain(flows_dir: Path, start: int, end: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Composed displacements between anchor `start` and target `end`.
+    Returns (F_{end→start}, F_{start→end}): the first samples anchor content
+    into the target frame; the second is its round-trip partner for FB gating.
+    Composing resamples a smooth vector field per step (negligible blur);
+    the single RGBA sample off the pristine anchor happens in star_warp."""
+    if end > start:
+        back = flow_service.load_flow(flows_dir, end - 1, "bwd").to(device)   # end→end-1
+        for k in range(end - 1, start, -1):
+            back = flow_service.compose_flow(
+                back, flow_service.load_flow(flows_dir, k - 1, "bwd").to(device))
+        fwd = flow_service.load_flow(flows_dir, start, "fwd").to(device)      # start→start+1
+        for k in range(start + 1, end):
+            fwd = flow_service.compose_flow(
+                fwd, flow_service.load_flow(flows_dir, k, "fwd").to(device))
+        return back, fwd
+    # end < start: sample direction chains fwd pairs, gate partner chains bwd pairs
+    back = flow_service.load_flow(flows_dir, end, "fwd").to(device)           # end→end+1
+    for k in range(end + 1, start):
+        back = flow_service.compose_flow(
+            back, flow_service.load_flow(flows_dir, k, "fwd").to(device))
+    fwd = flow_service.load_flow(flows_dir, start - 1, "bwd").to(device)      # start→start-1
+    for k in range(start - 1, end, -1):
+        fwd = flow_service.compose_flow(
+            fwd, flow_service.load_flow(flows_dir, k - 1, "bwd").to(device))
+    return back, fwd
+
+
+@torch.no_grad()
+def star_warp(anchor: EditLayer, anchor_index: int, target_indices: list[int],
+              flows_dir: Path, device: torch.device) -> dict[int, EditLayer]:
+    payload = np.concatenate([anchor.rgb.astype(np.float32),
+                              anchor.alpha[..., None] * 255.0,
+                              anchor.validity[..., None] * 255.0], axis=2)  # (H,W,5)
+    src = torch.from_numpy(payload).permute(2, 0, 1)[None].to(device)
+    out: dict[int, EditLayer] = {}
+    for t in sorted(target_indices):
+        if t == anchor_index:
+            out[t] = EditLayer(anchor.rgb.copy(), anchor.alpha.copy(), anchor.validity.copy())
+            continue
+        f_ta, f_at = _compose_chain(flows_dir, anchor_index, t, device)
+        warped = flow_service.warp(src, f_ta)[0].permute(1, 2, 0).cpu().numpy()
+        valid = flow_service.fb_check(f_ta, f_at)[0, 0].cpu().numpy()   # gate composed flows
+        out[t] = EditLayer(
+            rgb=np.clip(warped[..., :3], 0, 255).astype(np.uint8),
+            alpha=np.clip(warped[..., 3] / 255.0, 0, 1),
+            validity=np.clip(warped[..., 4] / 255.0, 0, 1) * valid,
+        )
+    return out
+
+
+def composite(frame: np.ndarray, layer: EditLayer, mask_alpha: np.ndarray) -> np.ndarray:
+    """out = α·E + (1−α)·I with α = mask · layer alpha · validity gate (§2.5)."""
+    a = (mask_alpha * layer.alpha * (layer.validity >= 0.5))[..., None].astype(np.float32)
+    out = a * layer.rgb.astype(np.float32) + (1 - a) * frame.astype(np.float32)
+    return np.clip(out, 0, 255).astype(np.uint8)
