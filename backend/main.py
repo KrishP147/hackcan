@@ -223,6 +223,8 @@ async def _background_segment_and_propagate(project_id: str, frame_index: int, c
         mask_img = (mask.astype(np.uint8)) * 255
         mask_path = masks_dir / f"mask_{frame_index:04d}.png"
         Image.fromarray(mask_img).save(mask_path)
+        from services import mask_service
+        mask_service.condition_single(mask_path)
         print(f"[SAM2] Saved mask to {mask_path}")
 
         # Count existing masks to update mask_count
