@@ -74,6 +74,34 @@ def star_warp(anchor: EditLayer, anchor_index: int, target_indices: list[int],
     return out
 
 
+def blend_bidirectional(past: EditLayer, fut: EditLayer,
+                        dist_past: int, dist_fut: int, eps: float = 1e-3) -> EditLayer:
+    """§2.4: per-pixel blend weighted by temporal distance × validity.
+    Something hidden looking forward is often visible looking back."""
+    wp = past.validity / (dist_past + eps)
+    wf = fut.validity / (dist_fut + eps)
+    tot = wp + wf
+    safe = np.where(tot > 0, tot, 1.0)[..., None]
+    rgb = (wp[..., None] * past.rgb + wf[..., None] * fut.rgb) / safe
+    alpha = (wp * past.alpha + wf * fut.alpha) / safe[..., 0]
+    best = np.maximum(past.validity, fut.validity)
+    validity = np.where(best >= 0.5, best, 0.0).astype(np.float32)
+    return EditLayer(np.clip(rgb, 0, 255).astype(np.uint8),
+                     np.clip(alpha, 0, 1).astype(np.float32), validity)
+
+
+def needs_reanchor(layer: EditLayer, mask_alpha: np.ndarray,
+                   anchor_mask_area: float, frames_since_anchor: int) -> bool:
+    """§2.6 triggers: validity collapse, mask-area drift, chain-length cap."""
+    inside = mask_alpha > 0.5
+    if inside.any() and layer.validity[inside].mean() < 0.7:
+        return True
+    area = float(inside.sum())
+    if anchor_mask_area > 0 and abs(area / anchor_mask_area - 1.0) > 0.3:
+        return True
+    return frames_since_anchor >= 60
+
+
 def composite(frame: np.ndarray, layer: EditLayer, mask_alpha: np.ndarray) -> np.ndarray:
     """out = α·E + (1−α)·I with α = mask · layer alpha · validity gate (§2.5)."""
     a = (mask_alpha * layer.alpha * (layer.validity >= 0.5))[..., None].astype(np.float32)

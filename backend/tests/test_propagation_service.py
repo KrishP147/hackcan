@@ -58,3 +58,34 @@ def test_composite_blends_only_valid_masked_pixels(tmp_project):
     out = composite(frame, layer, mask)
     assert out[10, 5, 2] == 255                               # valid → edit shows
     assert out[10, W - 5, 2] == 100                           # gated → original footage
+
+
+from services.propagation_service import blend_bidirectional, needs_reanchor
+
+
+def _layer(val_left, val_right, red=255):
+    rgb = np.zeros((H, W, 3), np.uint8)
+    rgb[:, :, 0] = red
+    alpha = np.ones((H, W), np.float32)
+    v = np.zeros((H, W), np.float32)
+    v[:, :W // 2] = val_left
+    v[:, W // 2:] = val_right
+    return EditLayer(rgb, alpha, v)
+
+
+def test_bidirectional_fills_disocclusion_from_other_side():
+    past = _layer(1.0, 0.0, red=200)   # right half occluded looking forward
+    fut = _layer(1.0, 1.0, red=100)    # visible looking back
+    out = blend_bidirectional(past, fut, dist_past=2, dist_fut=2)
+    assert out.rgb[10, W - 5, 0] == 100          # right half sourced from future
+    assert 100 < out.rgb[10, 5, 0] < 200         # left half blends both
+    assert out.validity[10, W - 5] > 0.5
+
+
+def test_reanchor_triggers():
+    good = _layer(1.0, 1.0)
+    mask = np.ones((H, W), np.float32)
+    assert not needs_reanchor(good, mask, anchor_mask_area=mask.sum(), frames_since_anchor=10)
+    assert needs_reanchor(_layer(0.4, 0.4), mask, mask.sum(), 10)          # validity collapse
+    assert needs_reanchor(good, mask, anchor_mask_area=mask.sum() * 2, frames_since_anchor=10)  # area jump
+    assert needs_reanchor(good, mask, mask.sum(), frames_since_anchor=60)  # chain cap
