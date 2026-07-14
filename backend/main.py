@@ -30,6 +30,26 @@ app.add_middleware(
     allow_headers=["*", "Authorization"],
 )
 
+# Per-IP token bucket (30 req/min, refill 0.5/s) — enabled via RATE_LIMIT=1 (Modal deploy)
+import os as _os
+import time as _time
+
+_rate_buckets: dict[str, tuple[float, float]] = {}  # ip -> (tokens, last_refill)
+
+if _os.getenv("RATE_LIMIT", "0") == "1":
+    @app.middleware("http")
+    async def rate_limit(request, call_next):
+        from fastapi.responses import JSONResponse
+        ip = request.client.host if request.client else "unknown"
+        tokens, last = _rate_buckets.get(ip, (30.0, _time.monotonic()))
+        now = _time.monotonic()
+        tokens = min(30.0, tokens + (now - last) * 0.5)
+        if tokens < 1.0:
+            _rate_buckets[ip] = (tokens, now)
+            return JSONResponse({"error": "Rate limit exceeded"}, status_code=429)
+        _rate_buckets[ip] = (tokens - 1.0, now)
+        return await call_next(request)
+
 
 @app.on_event("startup")
 async def startup():
