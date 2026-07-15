@@ -122,6 +122,8 @@ export default function EditorPage() {
           frameWidth={editor.frameWidth}
           frameHeight={editor.frameHeight}
           previewFrameUrl={editor.aiPreviewFrameUrl}
+          instantPreviewUrl={editor.instantPreviewUrl}
+          instantPreviewFrame={editor.instantPreviewFrame}
           aiEditStatus={editor.aiEditStatus}
           storageBaseUrl={editor.storageBaseUrl}
           onSelectObject={editor.selectObject}
@@ -172,7 +174,7 @@ export default function EditorPage() {
       />
 
       <EditProgressOverlay
-        show={editor.isProcessing && (editor.editStatus === "uploading" || editor.editStatus === "editing")}
+        show={editor.isProcessing}
         progress={editor.editProgress}
         status={editor.editStatus}
       />

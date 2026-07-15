@@ -1,10 +1,14 @@
+import os
 import uuid
 import json
 import threading
 import tempfile
 from pathlib import Path
 
-BASE_DIR = Path(tempfile.gettempdir()) / "frameshift"
+# On Modal this points at the mounted Volume (system of record, Doc 1 §9);
+# locally it falls back to the OS temp dir.
+BASE_DIR = Path(os.getenv("FRAMESHIFT_PROJECTS_DIR")
+                or Path(tempfile.gettempdir()) / "frameshift")
 
 _locks: dict[str, threading.Lock] = {}
 _locks_lock = threading.Lock()

@@ -59,9 +59,12 @@ def _pad8(t: torch.Tensor):
 @torch.no_grad()
 def compute_flows(frames_dir: Path, flows_dir: Path,
                   device: torch.device | None = None,
-                  num_flow_updates: int = 12) -> int:
+                  num_flow_updates: int = 12,
+                  start: int | None = None, end: int | None = None) -> int:
     """Pairwise RAFT flow on ORIGINAL footage, cached to disk once per project.
-    flow_fwd_%04d.npy = F_{t→t+1}, flow_bwd_%04d.npy = F_{t+1→t}, indexed by t."""
+    flow_fwd_%04d.npy = F_{t→t+1}, flow_bwd_%04d.npy = F_{t+1→t}, indexed by t.
+    start/end (1-based frame numbers) restrict computation to the pairs an edit
+    actually needs; omitted → whole clip."""
     from services.config import get_device
     device = device or get_device()
     flows_dir.mkdir(parents=True, exist_ok=True)
@@ -70,6 +73,8 @@ def compute_flows(frames_dir: Path, flows_dir: Path,
     pairs = 0
     for i in range(len(frames) - 1):
         idx = i + 1  # 1-based pair index = left frame number
+        if (start is not None and idx < start) or (end is not None and idx >= end):
+            continue
         fwd_p = flows_dir / f"flow_fwd_{idx:04d}.npy"
         bwd_p = flows_dir / f"flow_bwd_{idx:04d}.npy"
         pairs += 1

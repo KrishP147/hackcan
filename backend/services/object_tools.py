@@ -1,6 +1,8 @@
 """delete / resize / move (Doc 1 §5.2–§5.4) — deterministic transports riding
 the §4 temporal inpainter. Cutouts come from the ORIGINAL frame per index, so
-these tools cannot morph; only revealed background needs the inpainter."""
+these tools cannot morph; only revealed background needs the inpainter.
+Each tool saves frames as they complete and reports via frame_done_cb so the
+UI can sweep the result across the clip instead of waiting for the whole range."""
 from pathlib import Path
 
 import cv2
@@ -25,17 +27,20 @@ def _load(project_dir: Path, indices):
     return frames, masks
 
 
-def _save(project_dir: Path, frames: dict):
-    for t, img in frames.items():
-        cv2.imwrite(str(project_dir / "frames" / f"frame_{t:04d}.jpg"), img,
-                    [cv2.IMWRITE_JPEG_QUALITY, 95])
+def _save_one(project_dir: Path, t: int, img: np.ndarray, frame_done_cb=None):
+    cv2.imwrite(str(project_dir / "frames" / f"frame_{t:04d}.jpg"), img,
+                [cv2.IMWRITE_JPEG_QUALITY, 95])
+    if frame_done_cb:
+        frame_done_cb(t)
 
 
-def apply_delete_range(project_dir: Path, frame_indices, device) -> None:
+def apply_delete_range(project_dir: Path, frame_indices, device,
+                       frame_done_cb=None) -> None:
     frames, masks = _load(project_dir, frame_indices)
     holes = {t: _grow(masks[t] > 0.5) for t in frame_indices}
-    _save(project_dir, inpaint_service.inpaint_video(frames, holes,
-                                                     project_dir / "flows", device))
+    inpaint_service.inpaint_video(
+        frames, holes, project_dir / "flows", device,
+        on_frame=lambda t, filled: _save_one(project_dir, t, filled, frame_done_cb))
 
 
 def _shift_mask(mask: np.ndarray, dx: int, dy: int) -> np.ndarray:
@@ -53,7 +58,8 @@ def _shift_rgb(img: np.ndarray, dx: int, dy: int) -> np.ndarray:
                      for c in range(img.shape[2])], axis=2)
 
 
-def apply_move_range(project_dir: Path, frame_indices, offsets: dict, device) -> None:
+def apply_move_range(project_dir: Path, frame_indices, offsets: dict, device,
+                     frame_done_cb=None) -> None:
     frames, masks = _load(project_dir, frame_indices)
     cutouts = {t: frames[t].copy() for t in frame_indices}
     holes = {}
@@ -61,20 +67,22 @@ def apply_move_range(project_dir: Path, frame_indices, offsets: dict, device) ->
         # plate = original with the WHOLE object removed; the moved cutout is
         # pasted on top, so the inpaint never borders contaminated object pixels
         holes[t] = _grow(masks[t] > 0.5)
-    plates = inpaint_service.inpaint_video(frames, holes, project_dir / "flows", device)
-    out = {}
-    for t in frame_indices:
+
+    def _composite(t, plate):
         dx, dy = offsets[t]
         alpha = mask_service.load_mask_alpha(project_dir / "masks", t, feather_px=3)
         moved_alpha = _shift_mask(alpha, dx, dy)[..., None]
         moved_cut = _shift_rgb(cutouts[t], dx, dy)
-        plate = plates[t].astype(np.float32)
-        out[t] = np.clip(moved_alpha * moved_cut + (1 - moved_alpha) * plate,
-                         0, 255).astype(np.uint8)
-    _save(project_dir, out)
+        out = np.clip(moved_alpha * moved_cut + (1 - moved_alpha) * plate.astype(np.float32),
+                      0, 255).astype(np.uint8)
+        _save_one(project_dir, t, out, frame_done_cb)
+
+    inpaint_service.inpaint_video(frames, holes, project_dir / "flows", device,
+                                  on_frame=_composite)
 
 
-def apply_resize_range(project_dir: Path, frame_indices, scale: float, device) -> None:
+def apply_resize_range(project_dir: Path, frame_indices, scale: float, device,
+                       frame_done_cb=None) -> None:
     frames, masks = _load(project_dir, frame_indices)
     holes = {}
     scaled = {}
@@ -93,17 +101,21 @@ def apply_resize_range(project_dir: Path, frame_indices, scale: float, device) -
         s_rgb = cv2.warpAffine(frames[t], M, (w, h))
         scaled[t] = (s_rgb, s_alpha)
         holes[t] = _grow(m > 0) if scale < 1.0 else np.zeros(m.shape, bool)
-    if any(hm.any() for hm in holes.values()):
-        plates = inpaint_service.inpaint_video(frames, holes, project_dir / "flows", device)
-    else:
-        plates = {t: frames[t] for t in frame_indices}
-    out = {}
-    for t in frame_indices:
+
+    def _composite(t, plate):
         if scaled[t] is None:
-            out[t] = frames[t]
-            continue
+            _save_one(project_dir, t, frames[t], frame_done_cb)
+            return
         s_rgb, s_alpha = scaled[t]
         a = s_alpha[..., None]
-        out[t] = np.clip(a * s_rgb.astype(np.float32)
-                         + (1 - a) * plates[t].astype(np.float32), 0, 255).astype(np.uint8)
-    _save(project_dir, out)
+        out = np.clip(a * s_rgb.astype(np.float32)
+                      + (1 - a) * plate.astype(np.float32), 0, 255).astype(np.uint8)
+        _save_one(project_dir, t, out, frame_done_cb)
+
+    if any(hm.any() for hm in holes.values()):
+        inpaint_service.inpaint_video(frames, holes, project_dir / "flows", device,
+                                      on_frame=_composite)
+    else:
+        # scale-up occludes rather than reveals — no inpaint, no flow needed
+        for t in frame_indices:
+            _composite(t, frames[t])

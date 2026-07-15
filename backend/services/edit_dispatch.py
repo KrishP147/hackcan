@@ -6,6 +6,11 @@ delete                                -> object_tools.apply_delete_range (§5.3)
 move                                  -> object_tools.apply_move_range (§5.4)
 bg_replace                            -> background_tool (§5.5)
 replace                               -> propagation engine (§5.6); Backend B if USE_SYNTH
+
+Heavy sync work runs in worker threads (asyncio.to_thread) so the API event
+loop keeps serving frames/status while an edit propagates. Frames complete
+anchor-out and are reported per frame via edit_sweep status so the UI can
+show the edit spreading across the clip.
 """
 import asyncio
 from pathlib import Path
@@ -16,16 +21,20 @@ from services import (background_tool, config, flow_service, local_edit_service,
                       mask_service, object_tools, project_manager, replace_tool)
 
 DETERMINISTIC = {"recolor", "blur_region", "color_pop", "glow"}
+INPAINT_MARGIN = 8  # temporal inpainter reaches ±8 donor frames outside the range
 
 
 def _project_dir(project_id: str) -> Path:
     return project_manager.get_project_dir(project_id)
 
 
-def _ensure_flows(project_dir: Path):
-    """RAFT flow on original footage — cached once per project, cheap on re-edit."""
+def _ensure_flows(project_dir: Path, start: int, end: int):
+    """RAFT flow on original footage — cached once per project, cheap on re-edit.
+    Restricted to the pairs this edit can touch (range + inpaint donor margin)."""
     flow_service.compute_flows(project_dir / "frames", project_dir / "flows",
-                               device=config.get_device())
+                               device=config.get_device(),
+                               start=max(1, start - INPAINT_MARGIN),
+                               end=end + INPAINT_MARGIN)
 
 
 def _ensure_masks(project_id: str, project_dir: Path, start: int, end: int):
@@ -50,6 +59,54 @@ def _ensure_masks(project_id: str, project_dir: Path, start: int, end: int):
     mask_service.stabilize_masks(masks_dir)
 
 
+class _Sweep:
+    """Tracks per-frame completion and publishes it as edit_sweep status.
+    Frames complete either anchor-out (deterministic) or ascending (transports);
+    both keep [lo, hi] contiguous so the frontend can refresh exactly that range."""
+
+    def __init__(self, project_id: str, total: int):
+        self.project_id = project_id
+        self.total = total
+        self.done = 0
+        self.lo = None
+        self.hi = None
+
+    def frame_done(self, t: int):
+        self.done += 1
+        self.lo = t if self.lo is None else min(self.lo, t)
+        self.hi = t if self.hi is None else max(self.hi, t)
+        try:
+            project_manager.update_status(
+                self.project_id,
+                edit_sweep={"lo": self.lo, "hi": self.hi,
+                            "done": self.done, "total": self.total})
+        except OSError:
+            pass  # progress telemetry must never abort the edit itself
+
+
+def _anchor_out(indices: list[int], center: int) -> list[int]:
+    """Order frames by distance from the frame the user is looking at, so the
+    edit lands there first and visibly spreads outward."""
+    return sorted(indices, key=lambda t: (abs(t - center), t))
+
+
+def _run_deterministic(rule, project_dir: Path, ordered: list[int], sweep: _Sweep):
+    for t in ordered:
+        fp = project_dir / "frames" / f"frame_{t:04d}.jpg"
+        mp = project_dir / "masks" / f"mask_{t:04d}.png"
+        if not fp.exists():
+            continue
+        if rule.edit_type == "recolor":
+            local_edit_service.apply_recolor(fp, mp, rule.color or "FF0000")
+        elif rule.edit_type == "blur_region":
+            local_edit_service.apply_blur_region(fp, mp, rule.blur_strength or 10)
+        elif rule.edit_type == "color_pop":
+            local_edit_service.apply_color_pop(fp, mp)
+        elif rule.edit_type == "glow":
+            local_edit_service.apply_glow(fp, mp)
+        sweep.frame_done(t)
+
+
 async def run_edit_rule(project_id: str, rule, progress_cb=None) -> None:
     project_dir = _project_dir(project_id)
     device = config.get_device()
@@ -57,40 +114,38 @@ async def run_edit_rule(project_id: str, rule, progress_cb=None) -> None:
     status = project_manager.get_status(project_id)
     anchor = status.get("anchor_frame") or rule.start_frame
     anchor = min(max(anchor, rule.start_frame), rule.end_frame)
+    center = getattr(rule, "preview_frame", None) or anchor
+    center = min(max(center, rule.start_frame), rule.end_frame)
+    sweep = _Sweep(project_id, len(indices))
 
     if rule.edit_type in DETERMINISTIC:
-        _ensure_masks(project_id, project_dir, rule.start_frame, rule.end_frame)
-        loop = asyncio.get_event_loop()
-        for n, t in enumerate(indices, 1):
-            fp = project_dir / "frames" / f"frame_{t:04d}.jpg"
-            mp = project_dir / "masks" / f"mask_{t:04d}.png"
-            if not fp.exists():
-                continue
-            if rule.edit_type == "recolor":
-                await loop.run_in_executor(
-                    None, local_edit_service.apply_recolor, fp, mp, rule.color or "FF0000")
-            elif rule.edit_type == "blur_region":
-                await loop.run_in_executor(
-                    None, local_edit_service.apply_blur_region, fp, mp,
-                    rule.blur_strength or 10)
-            elif rule.edit_type == "color_pop":
-                await loop.run_in_executor(None, local_edit_service.apply_color_pop, fp, mp)
-            elif rule.edit_type == "glow":
-                await loop.run_in_executor(None, local_edit_service.apply_glow, fp, mp)
-            if progress_cb:
-                progress_cb(n, len(indices))
+        await asyncio.to_thread(
+            _ensure_masks, project_id, project_dir, rule.start_frame, rule.end_frame)
+        await asyncio.to_thread(
+            _run_deterministic, rule, project_dir, _anchor_out(indices, center), sweep)
+        if progress_cb:
+            progress_cb(len(indices), len(indices))
         return
 
-    _ensure_flows(project_dir)                      # transport + generative need flow
-    _ensure_masks(project_id, project_dir, rule.start_frame, rule.end_frame)
+    if not (rule.edit_type == "resize" and (rule.scale or 1.5) >= 1.0):
+        # transports + generative need flow; resize-up occludes, needs none
+        await asyncio.to_thread(
+            _ensure_flows, project_dir, rule.start_frame, rule.end_frame)
+    await asyncio.to_thread(
+        _ensure_masks, project_id, project_dir, rule.start_frame, rule.end_frame)
 
     if rule.edit_type == "delete":
-        object_tools.apply_delete_range(project_dir, indices, device)
+        await asyncio.to_thread(object_tools.apply_delete_range,
+                                project_dir, indices, device, sweep.frame_done)
     elif rule.edit_type == "resize":
-        object_tools.apply_resize_range(project_dir, indices, rule.scale or 1.5, device)
+        await asyncio.to_thread(object_tools.apply_resize_range,
+                                project_dir, indices, rule.scale or 1.5, device,
+                                sweep.frame_done)
     elif rule.edit_type == "move":
         offsets = {t: (rule.dx or 0, rule.dy or 0) for t in indices}
-        object_tools.apply_move_range(project_dir, indices, offsets, device)
+        await asyncio.to_thread(object_tools.apply_move_range,
+                                project_dir, indices, offsets, device,
+                                sweep.frame_done)
     elif rule.edit_type == "bg_replace":
         await background_tool.apply_background_replace_range(
             project_dir, indices, anchor, rule.prompt or "", device)

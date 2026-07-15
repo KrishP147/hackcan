@@ -27,6 +27,8 @@ interface EditorCanvasProps {
   frameWidth: number;
   frameHeight: number;
   previewFrameUrl: string | null;
+  instantPreviewUrl?: string | null;
+  instantPreviewFrame?: number | null;
   aiEditStatus: "idle" | "preview" | "applying" | "done";
   storageBaseUrl: string | null;
   onSelectObject: (id: string | null) => void;
@@ -56,6 +58,8 @@ export function EditorCanvas({
   frameWidth,
   frameHeight,
   previewFrameUrl,
+  instantPreviewUrl,
+  instantPreviewFrame,
   aiEditStatus,
   storageBaseUrl,
   onSelectObject,
@@ -165,7 +169,11 @@ export function EditorCanvas({
   const currentFrameIndex = currentFrame + 1; // Backend uses 1-based indexing
   const frameVersion = transformedFrameVersions?.[currentFrameIndex] ?? editVersion;
   const paddedIndex = String(currentFrameIndex).padStart(4, "0");
-  const frameUrl = aiEditStatus === "preview" && previewFrameUrl
+  // Instant preview wins for its own frame — the edit appears the moment the
+  // button is pressed, then the propagated real frame replaces it
+  const frameUrl = instantPreviewUrl != null && instantPreviewFrame === currentFrame
+    ? instantPreviewUrl
+    : aiEditStatus === "preview" && previewFrameUrl
     ? previewFrameUrl
     : projectId
     ? storageBaseUrl && frameVersion === 0

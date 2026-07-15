@@ -33,6 +33,8 @@ class Server:
     @modal.enter(snap=True)
     def warm(self):
         """Load SAM 2 + RAFT once; memory snapshots restore a warmed process."""
+        import os
+        os.environ.setdefault("FRAMESHIFT_PROJECTS_DIR", "/root/projects")
         import torch
         from services import flow_service, sam2_service
         sam2_service.get_image_predictor()
@@ -42,5 +44,7 @@ class Server:
     def fastapi_app(self):
         import os
         os.environ.setdefault("RATE_LIMIT", "1")
+        # projects live on the Volume, not the container's ephemeral /tmp
+        os.environ.setdefault("FRAMESHIFT_PROJECTS_DIR", "/root/projects")
         from main import app as fastapi
         return fastapi

@@ -22,9 +22,11 @@ app = FastAPI(title="FrameShift AI")
 # Track cancellable operations per project
 _cancel_flags: dict[str, bool] = {}
 
+import os as _os_cors
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://your-vercel-domain.vercel.app"],
+    allow_origins=[o for o in ("http://localhost:3000",
+                               _os_cors.getenv("FRONTEND_ORIGIN")) if o],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*", "Authorization"],
@@ -123,6 +125,11 @@ def _background_extract(project_id: str):
                                    frame_width=frame_width, frame_height=frame_height,
                                    detecting=False, detections={})
 
+    # Kick RAFT flow precompute now (cached once per project, Doc 1 §2.1) so
+    # delete/move/resize-down/replace don't pay the flow cost on first press
+    import threading
+    threading.Thread(target=_background_flows, args=(project_id,), daemon=True).start()
+
     # YOLO detection disabled
     # # Run YOLO on all frames, updating detections progressively
     # detections = {}
@@ -135,6 +142,30 @@ def _background_extract(project_id: str):
     #         project_manager.update_status(project_id, detections=detections, detected_frames=i)
     # 
     # project_manager.update_status(project_id, detecting=False, detections=detections, detected_frames=len(frame_files))
+
+def _background_flows(project_id: str):
+    """Pairwise RAFT flow over the whole clip, cached to flows/. Safe to call
+    repeatedly — already-cached pairs are skipped."""
+    try:
+        status = project_manager.get_status(project_id)
+        if status.get("flow_status") == "computing":
+            return
+        project_manager.update_status(project_id, flow_status="computing")
+        from services import config as _config, flow_service
+        project_dir = project_manager.get_project_dir(project_id)
+        flow_service.compute_flows(project_dir / "frames", project_dir / "flows",
+                                   device=_config.get_device())
+        project_manager.update_status(project_id, flow_status="done")
+    except Exception as e:
+        project_manager.update_status(project_id, flow_status="error", flow_error=str(e))
+
+
+@app.post("/flows/precompute")
+async def precompute_flows(req: ExtractRequest):
+    """Manually invoke optical-flow precompute for a project (idempotent)."""
+    asyncio.ensure_future(asyncio.to_thread(_background_flows, req.project_id))
+    return {"project_id": req.project_id, "flow_status": "computing"}
+
 
 @app.post("/extract")
 async def extract_frames(req: ExtractRequest, background_tasks: BackgroundTasks):
@@ -307,6 +338,8 @@ class EditRule(BaseModel):
     dx: Optional[int] = None          # for move (frame-pixel offset)
     dy: Optional[int] = None
     backend: Optional[str] = None     # "B" forces synth backend for replace
+    preview_frame: Optional[int] = None  # frame the user is viewing — edit lands
+                                         # there first, then sweeps outward
 
 class EditRequest(BaseModel):
     project_id: str
@@ -341,8 +374,10 @@ async def _background_edit(project_id: str, edit_rules: List[EditRule]):
         project_manager.update_status(
             project_id,
             last_backup_timestamp=backup_timestamp,
+            last_backup_frames=sorted(frames_to_edit),
             edit_status="processing",
             edit_progress={"done": 0, "total": len(edit_rules)},
+            edit_sweep=None,
         )
 
         from services import edit_dispatch
@@ -416,14 +451,44 @@ async def edit_frames(req: EditRequest):
     if not any((project_dir / "frames").glob("frame_*.jpg")):
         return {"error": "No frames found. Run /extract first."}
 
-        project_manager.update_status(
-            req.project_id,
-            edit_status="editing",
-            edit_progress={"done": 0, "total": 0},
-        )
+    project_manager.update_status(
+        req.project_id,
+        edit_status="editing",
+        edit_progress={"done": 0, "total": 0},
+        edit_sweep=None,
+    )
     # Run as a proper async task instead of BackgroundTasks (which can't await)
     asyncio.ensure_future(_background_edit(req.project_id, req.edit_rules))
-    return {"project_id": req.project_id, "edit_status": "uploading"}
+    return {"project_id": req.project_id, "edit_status": "editing"}
+
+
+class PreviewRequest(BaseModel):
+    project_id: str
+    frame_index: int
+    edit_type: str
+    color: Optional[str] = None
+    blur_strength: Optional[int] = None
+    scale: Optional[float] = None
+    dx: Optional[int] = None
+    dy: Optional[int] = None
+
+
+@app.post("/edit/preview")
+async def edit_preview(req: PreviewRequest):
+    """Instant single-frame preview: JPEG of the edit applied to one frame,
+    in memory. The durable propagation runs separately via /edit."""
+    from fastapi.responses import Response
+    from services import preview_service
+    try:
+        jpeg = await asyncio.to_thread(
+            preview_service.render_preview,
+            req.project_id, req.frame_index, req.edit_type,
+            color=req.color, blur_strength=req.blur_strength,
+            scale=req.scale, dx=req.dx or 0, dy=req.dy or 0)
+    except (ValueError, FileNotFoundError, RuntimeError) as e:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return Response(content=jpeg, media_type="image/jpeg")
 
 
 class CancelRequest(BaseModel):

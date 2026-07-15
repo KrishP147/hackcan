@@ -51,6 +51,26 @@ def _compose_chain(flows_dir: Path, start: int, end: int, device) -> tuple[torch
     return back, fwd
 
 
+def iter_chain(flows_dir: Path, anchor: int, step: int, count: int, device):
+    """Walk away from `anchor` one frame at a time (step = +1 or -1), yielding
+    (t, F_{t→anchor}, F_{anchor→t}) for t = anchor+step, anchor+2·step, …
+    Each yield extends the previous composition by ONE pairwise flow — O(1)
+    per step instead of recomposing the whole chain (O(k)) per target, which
+    turned full-clip propagation into O(N²) flow loads."""
+    f_ta = f_at = None
+    for i in range(1, count + 1):
+        t = anchor + step * i
+        if step > 0:
+            step_ta = flow_service.load_flow(flows_dir, t - 1, "bwd").to(device)  # t→t-1
+            step_at = flow_service.load_flow(flows_dir, t - 1, "fwd").to(device)  # t-1→t
+        else:
+            step_ta = flow_service.load_flow(flows_dir, t, "fwd").to(device)      # t→t+1
+            step_at = flow_service.load_flow(flows_dir, t, "bwd").to(device)      # t+1→t
+        f_ta = step_ta if f_ta is None else flow_service.compose_flow(step_ta, f_ta)
+        f_at = step_at if f_at is None else flow_service.compose_flow(f_at, step_at)
+        yield t, f_ta, f_at
+
+
 @torch.no_grad()
 def star_warp(anchor: EditLayer, anchor_index: int, target_indices: list[int],
               flows_dir: Path, device: torch.device) -> dict[int, EditLayer]:
@@ -58,19 +78,26 @@ def star_warp(anchor: EditLayer, anchor_index: int, target_indices: list[int],
                               anchor.alpha[..., None] * 255.0,
                               anchor.validity[..., None] * 255.0], axis=2)  # (H,W,5)
     src = torch.from_numpy(payload).permute(2, 0, 1)[None].to(device)
+    targets = set(target_indices)
     out: dict[int, EditLayer] = {}
-    for t in sorted(target_indices):
-        if t == anchor_index:
-            out[t] = EditLayer(anchor.rgb.copy(), anchor.alpha.copy(), anchor.validity.copy())
+    if anchor_index in targets:
+        out[anchor_index] = EditLayer(anchor.rgb.copy(), anchor.alpha.copy(),
+                                      anchor.validity.copy())
+    for step in (1, -1):
+        side = [t for t in targets if (t - anchor_index) * step > 0]
+        if not side:
             continue
-        f_ta, f_at = _compose_chain(flows_dir, anchor_index, t, device)
-        warped = flow_service.warp(src, f_ta)[0].permute(1, 2, 0).cpu().numpy()
-        valid = flow_service.fb_check(f_ta, f_at)[0, 0].cpu().numpy()   # gate composed flows
-        out[t] = EditLayer(
-            rgb=np.clip(warped[..., :3], 0, 255).astype(np.uint8),
-            alpha=np.clip(warped[..., 3] / 255.0, 0, 1),
-            validity=np.clip(warped[..., 4] / 255.0, 0, 1) * valid,
-        )
+        count = max(abs(t - anchor_index) for t in side)
+        for t, f_ta, f_at in iter_chain(flows_dir, anchor_index, step, count, device):
+            if t not in targets:
+                continue
+            warped = flow_service.warp(src, f_ta)[0].permute(1, 2, 0).cpu().numpy()
+            valid = flow_service.fb_check(f_ta, f_at)[0, 0].cpu().numpy()  # gate composed flows
+            out[t] = EditLayer(
+                rgb=np.clip(warped[..., :3], 0, 255).astype(np.uint8),
+                alpha=np.clip(warped[..., 3] / 255.0, 0, 1),
+                validity=np.clip(warped[..., 4] / 255.0, 0, 1) * valid,
+            )
     return out
 
 

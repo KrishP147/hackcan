@@ -60,7 +60,14 @@ interface EditorState {
   isRefining: boolean;
   changeMarkers: Array<{ id: string; frame: number; editType: string; timestamp: number }>;
   isExporting: boolean;
+  instantPreviewUrl: string | null;    // blob URL of the single-frame preview
+  instantPreviewFrame: number | null;  // 0-based frame it belongs to
 }
+
+// Edits with a sub-second single-frame preview; replace/bg_replace are generative
+const PREVIEWABLE_ACTIONS = new Set([
+  "recolor", "blur_region", "color_pop", "glow", "resize", "delete", "move",
+]);
 
 const DEFAULT_EDIT_PARAMS: EditParams = {
   recolor: { color: "#F43F5E", opacity: 0.6 },
@@ -113,10 +120,44 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
     isRefining: false,
     changeMarkers: [],
     isExporting: false,
+    instantPreviewUrl: null,
+    instantPreviewFrame: null,
   });
 
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const acceptInProgressRef = useRef<boolean>(false);
+  // Range of frames already marked refreshed during the current edit sweep
+  const sweepMarkedRef = useRef<{ lo: number; hi: number } | null>(null);
+
+  // Reads edit_sweep {lo,hi,done,total} (1-based frames) from status and bumps
+  // per-frame versions for newly propagated frames, so the edit visibly spreads
+  // across the clip while the background pass runs. Drops the instant preview
+  // once real propagated pixels for its frame have landed.
+  const handleEditSweep = useCallback((status: { edit_sweep?: { lo: number; hi: number; done: number; total: number } | null }) => {
+    const sweep = status.edit_sweep;
+    if (!sweep || typeof sweep.lo !== "number" || typeof sweep.hi !== "number") return;
+    setState((s) => {
+      const prev = sweepMarkedRef.current;
+      const newlyDone: number[] = [];
+      for (let f = sweep.lo; f <= sweep.hi; f++) {
+        if (!prev || f < prev.lo || f > prev.hi) newlyDone.push(f);
+      }
+      sweepMarkedRef.current = { lo: sweep.lo, hi: sweep.hi };
+      if (newlyDone.length === 0) return s;
+      const versions = { ...(s.transformedFrameVersions || {}) };
+      for (const f of newlyDone) versions[f] = (versions[f] || 0) + 1;
+      const previewFrame1 = s.instantPreviewFrame !== null ? s.instantPreviewFrame + 1 : null;
+      const previewSwept = previewFrame1 !== null && previewFrame1 >= sweep.lo && previewFrame1 <= sweep.hi;
+      if (previewSwept && s.instantPreviewUrl) URL.revokeObjectURL(s.instantPreviewUrl);
+      return {
+        ...s,
+        transformedFrameVersions: versions,
+        editProgress: sweep.total > 0 ? { done: sweep.done, total: sweep.total } : s.editProgress,
+        instantPreviewUrl: previewSwept ? null : s.instantPreviewUrl,
+        instantPreviewFrame: previewSwept ? null : s.instantPreviewFrame,
+      };
+    });
+  }, []);
 
   // Unified polling for project status - single interval, handles all status updates
   useEffect(() => {
@@ -317,7 +358,10 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
               });
             }
 
-            // Update edit status (Cloudinary edits like recolor, remove, replace, etc.)
+            // Per-frame propagation sweep — refresh frames as the edit spreads
+            handleEditSweep(status);
+
+            // Update edit status (recolor, remove, replace, etc.)
             if (status.edit_status !== undefined) {
               const editDone = status.edit_status === "done";
               const editError = status.edit_status === "error";
@@ -327,12 +371,16 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
               setState((s) => {
                 // Only update if still processing — prevents repeated editVersion increments
                 if (!s.isProcessing && (editDone || editError || editCancelled)) return s;
+                const finished = editDone || editError || editCancelled;
+                if (finished && s.instantPreviewUrl) URL.revokeObjectURL(s.instantPreviewUrl);
                 return {
                   ...s,
-                  isProcessing: !(editDone || editError || editCancelled),
+                  isProcessing: !finished,
                   editProgress: editProgress,
                   editStatus: status.edit_status as "uploading" | "editing" | "done" | "error" | null,
                   editVersion: (editDone && s.isProcessing) ? s.editVersion + 1 : s.editVersion,
+                  instantPreviewUrl: finished ? null : s.instantPreviewUrl,
+                  instantPreviewFrame: finished ? null : s.instantPreviewFrame,
                   showToast: (editDone || editError) && s.isProcessing ? true : s.showToast,
                   toastMessage: editDone && s.isProcessing
                     ? "Edit applied successfully"
@@ -447,7 +495,7 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
         pollingRef.current = null;
       }
     };
-  }, [projectId]);
+  }, [projectId, handleEditSweep]);
 
   // Update displayed detections when frame changes
   useEffect(() => {
@@ -473,12 +521,15 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
     // They run automatically during /extract
   }, [state.projectId]);
 
-  const restartPolling = useCallback(() => {
+  const restartPolling = useCallback((intervalMs: number = 1500) => {
     if (!pollingRef.current && projectId) {
       const poll = async () => {
         try {
           const res = await fetch(`${API_URL}/project/${projectId}/status`);
           const status = await res.json();
+
+          // Per-frame propagation sweep — refresh frames as the edit spreads
+          handleEditSweep(status);
 
           // Handle segmentation status
           const hasMasks = (status.mask_count !== undefined && status.mask_count !== null && status.mask_count > 0);
@@ -503,17 +554,22 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
             });
           }
 
-          // Handle edit status (Cloudinary edits)
+          // Handle edit status
           if (status.edit_status !== undefined) {
             const editDone = status.edit_status === "done";
             const editError = status.edit_status === "error";
             const editCancelled = status.edit_status === "cancelled";
             setState((s) => {
               if (!s.isProcessing && (editDone || editError || editCancelled)) return s;
+              const finished = editDone || editError || editCancelled;
+              if (finished && s.instantPreviewUrl) URL.revokeObjectURL(s.instantPreviewUrl);
               return {
                 ...s,
-                isProcessing: !(editDone || editError || editCancelled),
+                isProcessing: !finished,
+                editProgress: status.edit_progress || s.editProgress,
                 editVersion: (editDone && s.isProcessing) ? s.editVersion + 1 : s.editVersion,
+                instantPreviewUrl: finished ? null : s.instantPreviewUrl,
+                instantPreviewFrame: finished ? null : s.instantPreviewFrame,
                 showToast: (editDone || editError) && s.isProcessing ? true : s.showToast,
                 toastMessage: editDone && s.isProcessing ? "Edit applied successfully"
                   : editError && s.isProcessing ? `Edit failed: ${status.edit_error || "Unknown error"}`
@@ -576,9 +632,9 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
         }
       };
       poll();
-      pollingRef.current = setInterval(poll, 1500);
+      pollingRef.current = setInterval(poll, intervalMs);
     }
-  }, [projectId]);
+  }, [projectId, handleEditSweep]);
 
   const segmentAtPoint = useCallback((clickX: number, clickY: number) => {
     setState((s) => {
@@ -714,12 +770,47 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
           edit_type: action,
           start_frame: startFrame,
           end_frame: endFrame,
+          preview_frame: s.currentFrame + 1,  // propagation lands here first, sweeps outward
         };
         if (params.color) editRule.color = params.color;
         if (params.prompt) editRule.prompt = params.prompt;
         if (params.scale) editRule.scale = params.scale;
         if (params.dx !== undefined) editRule.dx = params.dx;
         if (params.dy !== undefined) editRule.dy = params.dy;
+
+        // Instant single-frame preview: paint the effect on the visible frame
+        // in ~100-300ms while the full-clip propagation runs in the background
+        if (PREVIEWABLE_ACTIONS.has(action)) {
+          const previewFrame0 = s.currentFrame;
+          fetch(`${API_URL}/edit/preview`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              project_id: s.projectId,
+              frame_index: previewFrame0 + 1,
+              edit_type: action,
+              color: params.color,
+              scale: params.scale,
+              dx: params.dx,
+              dy: params.dy,
+            }),
+          })
+            .then(async (res) => {
+              if (!res.ok || !(res.headers.get("content-type") || "").includes("image")) return;
+              const blob = await res.blob();
+              const url = URL.createObjectURL(blob);
+              setState((prev) => {
+                // stale if another edit started or this one already finished
+                if (!prev.isProcessing) {
+                  URL.revokeObjectURL(url);
+                  return prev;
+                }
+                if (prev.instantPreviewUrl) URL.revokeObjectURL(prev.instantPreviewUrl);
+                return { ...prev, instantPreviewUrl: url, instantPreviewFrame: previewFrame0 };
+              });
+            })
+            .catch(() => { /* preview is best-effort; propagation still runs */ });
+        }
 
         // Log edit change
         const { addLog } = useChangeLogStore.getState();
@@ -746,6 +837,7 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
           timestamp: Date.now(),
         };
 
+        sweepMarkedRef.current = null;  // fresh sweep for this edit
         fetch(`${API_URL}/edit`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -754,8 +846,12 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
             edit_rules: [editRule],
           }),
         }).then(() => {
-          // Restart polling to track edit progress
-          restartPolling();
+          // Poll fast while the edit propagates so frames refresh as they land
+          if (pollingRef.current) {
+            clearInterval(pollingRef.current);
+            pollingRef.current = null;
+          }
+          restartPolling(500);
         });
 
         return {
