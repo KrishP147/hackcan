@@ -167,14 +167,14 @@ Create `frontend/.env.local`:
 
 ```env
 NEXT_PUBLIC_API_URL=http://localhost:8000
-NEXT_PUBLIC_PROFILE_ROUTE=/api/auth/profile
 AUTH0_SECRET=your_secret
-AUTH0_BASE_URL=http://localhost:3000
-AUTH0_ISSUER_BASE_URL=https://your-tenant.us.auth0.com
+APP_BASE_URL=http://localhost:3000
+AUTH0_DOMAIN=your-tenant.us.auth0.com
 AUTH0_CLIENT_ID=your_client_id
 AUTH0_CLIENT_SECRET=your_client_secret
+AUTH0_AUDIENCE=https://api.frameshift.app
 NEXT_PUBLIC_SUPABASE_URL=your_supabase_url
-SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
+SUPABASE_SECRET_KEY=your_server_secret_key
 ```
 
 Start the dev server:

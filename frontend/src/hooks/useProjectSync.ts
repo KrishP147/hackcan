@@ -13,12 +13,14 @@ export function useProjectSync({
   videoLoaded,
   status,
   thumbnailUrl,
+  name,
 }: {
   projectId: string;
   currentFrame: number;
   videoLoaded: boolean;
   status: string;
   thumbnailUrl?: string | null;
+  name?: string;
 }) {
   const { user } = useUser();
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -28,6 +30,21 @@ export function useProjectSync({
 
   // Only sync when authenticated (API requires auth)
   const isAuthenticated = !!user;
+
+  // Idempotently register the project. This also claims a project that was
+  // uploaded as a guest immediately before the user chose to sign in.
+  useEffect(() => {
+    if (!isAuthenticated || !projectId) return;
+    fetch("/api/projects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project_id: projectId,
+        name: name || "Untitled Project",
+        thumbnail_url: thumbnailUrl || null,
+      }),
+    }).catch(() => {});
+  }, [isAuthenticated, projectId, name, thumbnailUrl]);
 
   // Debounced frame position sync
   useEffect(() => {

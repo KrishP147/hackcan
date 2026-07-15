@@ -166,7 +166,7 @@ export function EditorTopBar({
             </p>
             <div className="flex flex-col gap-3">
               <a
-                href={`/api/auth/login?returnTo=${encodeURIComponent(window.location.pathname)}`}
+                href={`/auth/login?returnTo=${encodeURIComponent(window.location.pathname)}`}
                 className="bg-[#F43F5E] hover:bg-[#E11D48] text-white font-semibold text-sm px-6 py-3 rounded-xl transition-all duration-300 hover:scale-[1.02]"
               >
                 Sign in / Create account

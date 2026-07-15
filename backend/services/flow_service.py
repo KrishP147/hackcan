@@ -2,10 +2,16 @@
 grid_sample bilinear, padding zeros, align_corners=False, pixel centers +0.5.
 Doc 2 CUDA kernels must match this byte-for-byte."""
 from pathlib import Path
+import threading
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+
+_raft_model = None
+_raft_device = None
+_raft_model_lock = threading.Lock()
 
 
 @torch.no_grad()
@@ -43,6 +49,25 @@ def _build_raft(device):
     return raft_large(weights=Raft_Large_Weights.DEFAULT).to(device).eval()
 
 
+def get_raft_model(device: torch.device):
+    """Load RAFT once per process and retain it for later flow ranges."""
+    global _raft_model, _raft_device
+    device_key = str(device)
+    with _raft_model_lock:
+        if _raft_model is None or _raft_device != device_key:
+            _raft_model = _build_raft(device)
+            _raft_device = device_key
+    return _raft_model
+
+
+def reset_raft_model():
+    """Drop the process cache (primarily useful for tests/device changes)."""
+    global _raft_model, _raft_device
+    with _raft_model_lock:
+        _raft_model = None
+        _raft_device = None
+
+
 def _load_frame_tensor(path: Path, device) -> torch.Tensor:
     import cv2
     img = cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
@@ -60,17 +85,19 @@ def _pad8(t: torch.Tensor):
 def compute_flows(frames_dir: Path, flows_dir: Path,
                   device: torch.device | None = None,
                   num_flow_updates: int = 12,
-                  start: int | None = None, end: int | None = None) -> int:
+                  start: int | None = None, end: int | None = None,
+                  batch_size: int | None = None) -> int:
     """Pairwise RAFT flow on ORIGINAL footage, cached to disk once per project.
     flow_fwd_%04d.npy = F_{t→t+1}, flow_bwd_%04d.npy = F_{t+1→t}, indexed by t.
     start/end (1-based frame numbers) restrict computation to the pairs an edit
     actually needs; omitted → whole clip."""
-    from services.config import get_device
+    from services.config import get_device, get_raft_batch_size
     device = device or get_device()
+    batch_size = max(1, batch_size or get_raft_batch_size())
     flows_dir.mkdir(parents=True, exist_ok=True)
     frames = sorted(frames_dir.glob("frame_*.jpg"))
-    model = None
     pairs = 0
+    pending = []
     for i in range(len(frames) - 1):
         idx = i + 1  # 1-based pair index = left frame number
         if (start is not None and idx < start) or (end is not None and idx >= end):
@@ -80,14 +107,39 @@ def compute_flows(frames_dir: Path, flows_dir: Path,
         pairs += 1
         if fwd_p.exists() and bwd_p.exists():
             continue
-        if model is None:
-            model = _build_raft(device)
-        a, h, w = _pad8(_load_frame_tensor(frames[i], device))
-        b, _, _ = _pad8(_load_frame_tensor(frames[i + 1], device))
-        fwd = model(a, b, num_flow_updates=num_flow_updates)[-1][..., :h, :w]
-        bwd = model(b, a, num_flow_updates=num_flow_updates)[-1][..., :h, :w]
-        np.save(fwd_p, fwd[0].cpu().numpy().astype(np.float16))
-        np.save(bwd_p, bwd[0].cpu().numpy().astype(np.float16))
+        pending.append((frames[i], frames[i + 1], fwd_p, bwd_p))
+
+    if not pending:
+        return pairs
+
+    model = get_raft_model(device)
+    for offset in range(0, len(pending), batch_size):
+        chunk = pending[offset:offset + batch_size]
+        left, right, sizes = [], [], []
+        for left_path, right_path, _, _ in chunk:
+            a, h, w = _pad8(_load_frame_tensor(left_path, device))
+            b, _, _ = _pad8(_load_frame_tensor(right_path, device))
+            left.append(a)
+            right.append(b)
+            sizes.append((h, w))
+
+        a_batch = torch.cat(left, dim=0)
+        b_batch = torch.cat(right, dim=0)
+        fwd_batch = model(
+            a_batch, b_batch, num_flow_updates=num_flow_updates)[-1]
+        bwd_batch = model(
+            b_batch, a_batch, num_flow_updates=num_flow_updates)[-1]
+
+        for j, (_, _, fwd_p, bwd_p) in enumerate(chunk):
+            h, w = sizes[j]
+            np.save(
+                fwd_p,
+                fwd_batch[j, ..., :h, :w].cpu().numpy().astype(np.float16),
+            )
+            np.save(
+                bwd_p,
+                bwd_batch[j, ..., :h, :w].cpu().numpy().astype(np.float16),
+            )
     return pairs
 
 

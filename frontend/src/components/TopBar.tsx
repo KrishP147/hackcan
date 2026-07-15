@@ -50,7 +50,7 @@ export function TopBar() {
                 />
               )}
               <a
-                href="/api/auth/logout"
+                href="/auth/logout"
                 className="text-sm text-[var(--fg-muted)] hover:text-[var(--accent)] transition-colors"
               >
                 Sign out
@@ -58,7 +58,7 @@ export function TopBar() {
             </>
           ) : (
             <a
-              href="/api/auth/login?returnTo=/dashboard"
+              href="/auth/login?returnTo=/dashboard"
               className="text-sm font-semibold bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white px-5 py-2 rounded-xl transition-all duration-300 hover:scale-[1.02] active:scale-[0.98]"
             >
               Sign in

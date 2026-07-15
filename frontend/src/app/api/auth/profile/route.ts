@@ -1,8 +1,8 @@
-import { auth0 } from "@/lib/auth0";
+import { auth0, isAuth0Configured } from "@/lib/auth0";
 import { NextResponse } from "next/server";
 
 export async function GET() {
-  if (!process.env.AUTH0_DOMAIN || !process.env.AUTH0_CLIENT_ID || !process.env.AUTH0_SECRET) {
+  if (!isAuth0Configured()) {
     return new NextResponse(null, { status: 204 });
   }
   const session = await auth0.getSession();

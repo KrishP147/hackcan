@@ -1,13 +1,13 @@
-import { auth0 } from "@/lib/auth0";
+import { auth0, isAuth0Configured } from "@/lib/auth0";
 import { supabaseAdmin } from "@/lib/supabase";
 import { DashboardGrid } from "@/components/dashboard/DashboardGrid";
 import type { Project } from "@/lib/supabase";
 import { redirect } from "next/navigation";
 
 export default async function DashboardPage() {
-  if (!supabaseAdmin) redirect("/");
+  if (!supabaseAdmin || !isAuth0Configured()) redirect("/");
   const session = await auth0.getSession();
-  if (!session) redirect("/api/auth/login?returnTo=/dashboard");
+  if (!session) redirect("/auth/login?returnTo=/dashboard");
 
   const { data: projects } = await supabaseAdmin
     .from("projects")
@@ -40,7 +40,7 @@ export default async function DashboardPage() {
               {session.user.name ?? session.user.email}
             </span>
             <a
-              href="/api/auth/logout"
+              href="/auth/logout"
               className="text-sm text-[#6B7280] hover:text-[#F43F5E] transition-colors font-medium"
             >
               Sign out

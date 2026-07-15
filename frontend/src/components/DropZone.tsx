@@ -2,8 +2,13 @@
 
 import { useCallback, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Upload, Loader2, Play } from "lucide-react";
+import { AlertCircle, Clock3, Upload, Loader2 } from "lucide-react";
+import { getAccessToken } from "@auth0/nextjs-auth0/client";
 import { useVideoStore } from "@/stores/videoStore";
+import {
+  MAX_VIDEO_DURATION_SECONDS,
+  validateVideoUpload,
+} from "@/lib/video-upload";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -30,19 +35,46 @@ export function DropZone() {
 
   async function uploadFile(file: File) {
     setUploading(true);
-    setStatus("Uploading video...");
+    setStatus("Checking video length...");
 
     try {
+      await validateVideoUpload(file);
+      setStatus("Uploading video...");
+
       const formData = new FormData();
       formData.append("file", file);
 
-      const res = await fetch(`${API_URL}/upload`, { method: "POST", body: formData });
-      const data = await res.json();
-      if (!res.ok || data.error || !data.project_id) {
-        throw new Error(data.error || "Upload failed");
+      // Auth is optional. Signed-in users attach an Auth0 API token so the
+      // backend records ownership; guests continue with no Authorization header.
+      const headers: HeadersInit = {};
+      try {
+        const token = await getAccessToken();
+        if (token) headers.Authorization = `Bearer ${token}`;
+      } catch {
+        // No session or Auth0 is not configured: continue as a guest.
       }
 
-      // Register project in Supabase (best-effort — don't block navigation on failure)
+      const res = await fetch(`${API_URL}/upload`, {
+        method: "POST",
+        headers,
+        body: formData,
+      });
+      const data = await res.json();
+      if (!res.ok || data.error || !data.project_id) {
+        throw new Error(data.detail || data.error || "Upload failed");
+      }
+
+      // Keep guest history in this browser. Signed-in users additionally get a
+      // durable Supabase row that appears on every device in /dashboard.
+      addProject({
+        projectId: data.project_id,
+        videoName: file.name,
+        uploadedAt: Date.now(),
+        status: "created",
+      });
+      setCurrentProject(data.project_id);
+
+      // Register project in Supabase (best-effort — don't block navigation).
       await registerProject(data.project_id, file.name);
 
       // Redirect immediately — editor will kick off extract and poll for readiness
@@ -50,23 +82,6 @@ export function DropZone() {
     } catch (error) {
       setUploading(false);
       setStatus(error instanceof Error ? error.message : "Upload failed");
-    }
-  }
-
-  async function loadDemoVideo() {
-    setUploading(true);
-    setStatus("Preparing the FrameShift demo...");
-    try {
-      const response = await fetch(`${API_URL}/demo`, { method: "POST" });
-      const data = await response.json();
-      if (!response.ok || data.error || !data.project_id) {
-        throw new Error(data.detail || data.error || "Demo video is unavailable");
-      }
-      await registerProject(data.project_id, data.video_name || "FrameShift-demo.mp4");
-      router.push(`/editor/${data.project_id}`);
-    } catch (error) {
-      setUploading(false);
-      setStatus(error instanceof Error ? error.message : "Could not load demo video");
     }
   }
 
@@ -86,6 +101,8 @@ export function DropZone() {
     const file = e.dataTransfer.files[0];
     if (file && file.type.startsWith("video/")) {
       uploadFile(file);
+    } else {
+      setStatus("Please choose a video file.");
     }
   }, []);
 
@@ -118,6 +135,10 @@ export function DropZone() {
           <p className="text-[var(--fg-muted)] text-lg mb-4">
             Drag and drop your video here
           </p>
+          <div className="mb-5 flex items-center justify-center gap-2 text-sm font-semibold text-[var(--accent)]">
+            <Clock3 className="h-4 w-4" />
+            Videos must be under {MAX_VIDEO_DURATION_SECONDS} seconds
+          </div>
           <p className="text-[var(--fg-subtle)] text-sm mb-6">or</p>
           <div className="flex items-center justify-center gap-3 flex-wrap">
             <button
@@ -127,20 +148,16 @@ export function DropZone() {
               <Upload className="w-4 h-4" />
               Upload from device
             </button>
-            <button
-              onClick={handleUploadClick}
-              className="inline-flex items-center gap-2 px-7 py-3 rounded-xl bg-[var(--accent)] text-white font-semibold transition-all duration-300 hover:bg-[var(--accent-hover)] hover:scale-[1.02] active:scale-[0.98] cursor-pointer"
-            >
-              Get Started
-            </button>
           </div>
-          <button
-            onClick={loadDemoVideo}
-            className="inline-flex items-center gap-2 mt-5 text-sm font-semibold text-[var(--accent)] transition-opacity hover:opacity-70"
-          >
-            <Play className="w-3.5 h-3.5" fill="currentColor" />
-            Try the built-in demo video
-          </button>
+          {status && (
+            <p
+              role="alert"
+              className="mt-5 flex items-center justify-center gap-2 text-sm font-medium text-red-500"
+            >
+              <AlertCircle className="h-4 w-4 shrink-0" />
+              {status}
+            </p>
+          )}
         </>
       )}
       <input

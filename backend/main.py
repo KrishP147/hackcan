@@ -2,10 +2,16 @@ from fastapi import FastAPI, UploadFile, File, BackgroundTasks, Depends, HTTPExc
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from dotenv import load_dotenv
+
+# Load local configuration before importing services that read environment
+# variables (notably Auth0 and the projects directory).
+load_dotenv()
+
 from pydantic import BaseModel
 from typing import Optional, List
 import shutil
 import asyncio
+import math
 from functools import partial
 import numpy as np
 import uuid
@@ -13,10 +19,8 @@ from pathlib import Path
 from io import BytesIO
 
 from services import project_manager, ffmpeg_service, sam2_service, config
-from services.auth_service import get_current_user
+from services.auth_service import get_current_user, is_auth0_configured
 # film_service  # FILM disabled - using RIFE instead
-
-load_dotenv()
 
 app = FastAPI(title="FrameShift AI")
 
@@ -62,10 +66,42 @@ async def startup():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "compute_device": str(config.get_device())}
+    return {
+        "status": "ok",
+        "compute_device": str(config.get_device()),
+        "auth0_configured": is_auth0_configured(),
+    }
 
 
 # --- Upload ---
+
+MAX_UPLOAD_DURATION_SECONDS = 6.0
+
+
+def _validate_upload_duration(video_path: Path) -> float:
+    try:
+        duration = float(ffmpeg_service.probe_video(video_path)["duration"])
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload a valid, supported video file.",
+        ) from exc
+
+    if not math.isfinite(duration) or duration <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not determine the video's duration.",
+        )
+    if duration >= MAX_UPLOAD_DURATION_SECONDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Video must be under {MAX_UPLOAD_DURATION_SECONDS:g} seconds "
+                f"(received {duration:.1f} seconds)."
+            ),
+        )
+
+    return duration
 
 @app.post("/upload")
 async def upload_video(
@@ -80,26 +116,20 @@ async def upload_video(
         project_manager.update_status(project["project_id"], user_id=current_user.get("sub"))
 
     video_path = project_dir / "original.mp4"
-    with open(video_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    try:
+        with open(video_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        duration = _validate_upload_duration(video_path)
+    except Exception:
+        shutil.rmtree(project_dir, ignore_errors=True)
+        raise
+
+    project_manager.update_status(project["project_id"], duration=duration)
 
     # Video is staged on the local project volume for FFmpeg processing.
     return {
         "project_id": project["project_id"],
     }
-
-
-@app.post("/demo")
-async def load_demo_video():
-    """Create a local project from the bundled demo clip for presentations."""
-    source = Path(__file__).resolve().parent / "input" / "15454886_2560_1440_60fps.mp4"
-    if not source.exists():
-        raise HTTPException(status_code=404, detail="Bundled demo video is missing")
-
-    project = project_manager.create_project()
-    project_dir = project_manager.get_project_dir(project["project_id"])
-    shutil.copy2(source, project_dir / "original.mp4")
-    return {"project_id": project["project_id"], "video_name": "FrameShift-demo.mp4"}
 
 
 # --- Extract ---
@@ -117,10 +147,10 @@ def _background_extract(project_id: str):
     project_manager.update_status(project_id, status="extracting")
     try:
         info = ffmpeg_service.probe_video(video_path)
-        if info["duration"] > 15:
+        if info["duration"] >= MAX_UPLOAD_DURATION_SECONDS:
             project_manager.update_status(
                 project_id, status="error",
-                error="Clip too long (max 15s)")
+                error="Video must be under 6 seconds")
             return
         frame_count, used_fps = ffmpeg_service.extract_frames(video_path, frames_dir)
     except Exception as e:
@@ -140,10 +170,14 @@ def _background_extract(project_id: str):
                                    frame_width=frame_width, frame_height=frame_height,
                                    detecting=False, detections={})
 
-    # Kick RAFT flow precompute now (cached once per project, Doc 1 §2.1) so
-    # delete/move/resize-down/replace don't pay the flow cost on first press
-    import threading
-    threading.Thread(target=_background_flows, args=(project_id,), daemon=True).start()
+    # Flow is lazy by default. Starting RAFT here used to contend with SAM2 as
+    # soon as the user clicked an object. It can still be enabled explicitly
+    # for local benchmarking.
+    if config.should_precompute_flows():
+        import threading
+        threading.Thread(target=_background_flows, args=(project_id,), daemon=True).start()
+    else:
+        project_manager.update_status(project_id, flow_status="deferred")
 
     # YOLO detection disabled
     # # Run YOLO on all frames, updating detections progressively
@@ -168,8 +202,11 @@ def _background_flows(project_id: str):
         project_manager.update_status(project_id, flow_status="computing")
         from services import config as _config, flow_service
         project_dir = project_manager.get_project_dir(project_id)
-        flow_service.compute_flows(project_dir / "frames", project_dir / "flows",
-                                   device=_config.get_device())
+        with _config.gpu_job(f"raft:{project_id}"):
+            flow_service.compute_flows(
+                project_dir / "frames", project_dir / "flows",
+                device=_config.get_device(),
+            )
         project_manager.update_status(project_id, flow_status="done")
     except Exception as e:
         project_manager.update_status(project_id, flow_status="error", flow_error=str(e))
@@ -237,8 +274,21 @@ class SegmentRequest(BaseModel):
     click_x: int
     click_y: int
 
-async def _background_segment_and_propagate(project_id: str, frame_index: int, click_x: int, click_y: int):
-    """Segment the anchor, then cache a full-clip mask track for later edits."""
+
+def _segment_frame_serialized(frame_path: Path, click_x: int, click_y: int):
+    with config.gpu_job("sam2:keyframe"):
+        return sam2_service.segment_frame(frame_path, click_x, click_y)
+
+
+def _propagate_masks_serialized(propagate):
+    with config.gpu_job("sam2:tracking"):
+        return propagate()
+
+
+async def _background_segment_keyframe(
+    project_id: str, frame_index: int, click_x: int, click_y: int
+):
+    """Segment only the selected keyframe and wait for user confirmation."""
     try:
         project_dir = project_manager.get_project_dir(project_id)
         frames_dir = project_dir / "frames"
@@ -268,7 +318,7 @@ async def _background_segment_and_propagate(project_id: str, frame_index: int, c
         loop = asyncio.get_event_loop()
         mask = await loop.run_in_executor(
             None,
-            sam2_service.segment_frame,
+            _segment_frame_serialized,
             frame_path,
             click_x,
             click_y
@@ -289,14 +339,52 @@ async def _background_segment_and_propagate(project_id: str, frame_index: int, c
         print(f"[SAM2] Saved mask to {mask_path}")
 
         project_manager.update_status(
-            project_id, segmenting=True, segment_status="propagating",
+            project_id, segmenting=False, segment_status="keyframe_ready",
             mask_count=1, anchor_frame=frame_index,
             click_x=click_x, click_y=click_y,
             segment_error=None,
         )
+        print(f"[SAM2] Keyframe mask ready; awaiting propagation confirmation")
+    except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        print(f"[SAM2] Error during keyframe segmentation: {str(e)}")
+        print(error_trace)
+        project_manager.update_status(
+            project_id,
+            segmenting=False,
+            segment_status="error",
+            segment_error=str(e),
+        )
 
-        # Selection owns mask propagation. Every edit after this point reads
-        # the cached full-clip mask sequence instead of invoking SAM2 again.
+
+async def _background_propagate_segment(project_id: str):
+    """Track a confirmed keyframe mask through the complete clip."""
+    try:
+        project_dir = project_manager.get_project_dir(project_id)
+        frames_dir = project_dir / "frames"
+        masks_dir = project_dir / "masks"
+        status = project_manager.get_status(project_id)
+        frame_index = status.get("anchor_frame")
+        click_x = status.get("click_x")
+        click_y = status.get("click_y")
+        if not frame_index:
+            raise RuntimeError("No keyframe selection is ready")
+
+        mask_path = masks_dir / f"mask_{frame_index:04d}.png"
+        if not mask_path.exists():
+            raise RuntimeError("The keyframe mask is missing; select the object again")
+
+        from PIL import Image
+        from services import mask_service
+
+        project_manager.update_status(
+            project_id,
+            segmenting=True,
+            segment_status="propagating",
+            segment_error=None,
+        )
+        loop = asyncio.get_running_loop()
         propagate = partial(
             sam2_service.propagate_masks,
             frames_dir,
@@ -308,7 +396,8 @@ async def _background_segment_and_propagate(project_id: str, frame_index: int, c
             frame_step=config.get_mask_frame_step(),
             cancel_check=lambda: _cancel_flags.get(project_id, False),
         )
-        mask_count = await loop.run_in_executor(None, propagate)
+        mask_count = await loop.run_in_executor(
+            None, _propagate_masks_serialized, propagate)
         mask_service.stabilize_masks(masks_dir)
         project_manager.update_status(
             project_id,
@@ -318,10 +407,6 @@ async def _background_segment_and_propagate(project_id: str, frame_index: int, c
             segment_error=None,
         )
         print(f"[SAM2] Full mask propagation complete: {mask_count} frames")
-        
-        # Verify status was saved correctly
-        saved_status = project_manager.get_status(project_id)
-        print(f"[SAM2] Status after save: segmenting={saved_status.get('segmenting')}, segment_status={saved_status.get('segment_status')}, mask_count={saved_status.get('mask_count')}")
     except sam2_service.PropagationCancelled:
         project_manager.update_status(
             project_id, segmenting=False, segment_status="cancelled")
@@ -339,7 +424,7 @@ async def _background_segment_and_propagate(project_id: str, frame_index: int, c
 
 @app.post("/segment")
 async def segment_object(req: SegmentRequest, background_tasks: BackgroundTasks):
-    """Segment object at click point and propagate mask across frames."""
+    """Segment an object on one keyframe; propagation requires confirmation."""
     print(f"[SAM2] /segment endpoint called: project={req.project_id}, frame={req.frame_index}, click=({req.click_x}, {req.click_y})")
     
     project_dir = project_manager.get_project_dir(req.project_id)
@@ -366,7 +451,7 @@ async def segment_object(req: SegmentRequest, background_tasks: BackgroundTasks)
     _cancel_flags[req.project_id] = False
 
     background_tasks.add_task(
-        _background_segment_and_propagate,
+        _background_segment_keyframe,
         req.project_id, req.frame_index, req.click_x, req.click_y,
     )
 
@@ -375,6 +460,34 @@ async def segment_object(req: SegmentRequest, background_tasks: BackgroundTasks)
         "status": "processing",
         "anchor_frame": req.frame_index,
     }
+
+
+class SegmentPropagationRequest(BaseModel):
+    project_id: str
+
+
+@app.post("/segment/propagate")
+async def propagate_segment(
+    req: SegmentPropagationRequest, background_tasks: BackgroundTasks
+):
+    """Propagate a prepared keyframe mask after explicit user confirmation."""
+    status = project_manager.get_status(req.project_id)
+    if status.get("segment_status") in {"segmenting", "propagating"} or status.get("segmenting"):
+        return {"error": "Segmentation is already in progress."}
+    if status.get("segment_status") != "keyframe_ready":
+        return {"error": "Select an object on a keyframe before tracking it."}
+    if status.get("edit_status") in {"uploading", "editing", "processing"}:
+        return {"error": "Wait for the current edit to finish before tracking the mask."}
+
+    _cancel_flags[req.project_id] = False
+    project_manager.update_status(
+        req.project_id,
+        segmenting=True,
+        segment_status="propagating",
+        segment_error=None,
+    )
+    background_tasks.add_task(_background_propagate_segment, req.project_id)
+    return {"project_id": req.project_id, "status": "propagating"}
 
 
 @app.get("/mask/{project_id}/{mask_index}")
@@ -406,6 +519,47 @@ class EditRule(BaseModel):
 class EditRequest(BaseModel):
     project_id: str
     edit_rules: List[EditRule]
+
+
+def _prepared_preview_generator(project_id: str, rule: EditRule):
+    """Return a generate-once wrapper for an approved generative preview."""
+    if rule.edit_type not in {"replace", "bg_replace"}:
+        return None
+    status = project_manager.get_status(project_id)
+    pending = status.get("pending_edit_preview") or {}
+    preview_frame = rule.preview_frame or rule.start_frame
+    if (
+        pending.get("edit_type") != rule.edit_type
+        or pending.get("frame_index") != preview_frame
+        or pending.get("prompt", "") != (rule.prompt or "")
+    ):
+        return None
+
+    preview_path = project_manager.get_project_dir(project_id) / "pending" / "edit_anchor.jpg"
+    if not preview_path.exists():
+        return None
+
+    if rule.edit_type == "replace":
+        from services import replace_tool
+        fallback = replace_tool._default_generate
+    else:
+        from services import background_tool
+        fallback = background_tool._default_generate
+    used = False
+
+    async def generate(frame_path, prompt, reference_frame_path=None, mask_path=None):
+        nonlocal used
+        if not used and reference_frame_path is None:
+            used = True
+            return preview_path.read_bytes()
+        return await fallback(
+            frame_path,
+            prompt,
+            reference_frame_path=reference_frame_path,
+            mask_path=mask_path,
+        )
+
+    return generate
 
 
 
@@ -466,11 +620,19 @@ async def _background_edit(project_id: str, edit_rules: List[EditRule]):
                     },
                 )
 
-            await edit_dispatch.run_edit_rule(
-                project_id, rule,
-                progress_cb=update_progress,
-                cancel_check=lambda: _cancel_flags.get(project_id, False),
-            )
+            prepared_generate = _prepared_preview_generator(project_id, rule)
+            try:
+                await edit_dispatch.run_edit_rule(
+                    project_id, rule,
+                    progress_cb=update_progress,
+                    cancel_check=lambda: _cancel_flags.get(project_id, False),
+                    generate=prepared_generate,
+                )
+            finally:
+                if prepared_generate is not None:
+                    pending_path = project_dir / "pending" / "edit_anchor.jpg"
+                    pending_path.unlink(missing_ok=True)
+                    project_manager.update_status(project_id, pending_edit_preview=None)
             if _cancel_flags.get(project_id):
                 project_manager.update_status(project_id, edit_status="cancelled")
                 return
@@ -579,6 +741,7 @@ class PreviewRequest(BaseModel):
     color: Optional[str] = None
     blur_strength: Optional[int] = None
     scale: Optional[float] = None
+    prompt: Optional[str] = None
     dx: Optional[int] = None
     dy: Optional[int] = None
 
@@ -590,11 +753,59 @@ async def edit_preview(req: PreviewRequest):
     from fastapi.responses import Response
     from services import preview_service
     try:
-        jpeg = await asyncio.to_thread(
-            preview_service.render_preview,
-            req.project_id, req.frame_index, req.edit_type,
-            color=req.color, blur_strength=req.blur_strength,
-            scale=req.scale, dx=req.dx or 0, dy=req.dy or 0)
+        project_dir = project_manager.get_project_dir(req.project_id)
+        pending_dir = project_dir / "pending"
+        pending_path = pending_dir / "edit_anchor.jpg"
+        if req.edit_type in {"replace", "bg_replace"}:
+            frame_path = project_dir / "frames" / f"frame_{req.frame_index:04d}.jpg"
+            mask_path = project_dir / "masks" / f"mask_{req.frame_index:04d}.png"
+            if not frame_path.exists():
+                raise FileNotFoundError(f"Frame {req.frame_index} not found")
+            if not mask_path.exists():
+                raise RuntimeError("No mask — click an object first")
+            if req.edit_type == "replace":
+                from services import replace_tool
+                generated = await replace_tool._default_generate(
+                    frame_path, req.prompt or "", mask_path=mask_path)
+                jpeg = generated
+            else:
+                from services import background_tool, mask_service
+                import cv2
+                generated = await background_tool._default_generate(
+                    frame_path, req.prompt or "", mask_path=mask_path)
+                frame = cv2.imread(str(frame_path))
+                plate = cv2.imdecode(np.frombuffer(generated, np.uint8), cv2.IMREAD_COLOR)
+                if plate is None:
+                    raise RuntimeError("Generated background could not be decoded")
+                if plate.shape[:2] != frame.shape[:2]:
+                    plate = cv2.resize(plate, (frame.shape[1], frame.shape[0]))
+                matte = background_tool.soft_matte(
+                    frame, mask_service.load_mask_alpha(project_dir / "masks", req.frame_index)
+                )[..., None]
+                output = matte * frame.astype(np.float32) + (1 - matte) * plate.astype(np.float32)
+                ok, encoded = cv2.imencode(".jpg", np.clip(output, 0, 255).astype(np.uint8),
+                                           [cv2.IMWRITE_JPEG_QUALITY, 95])
+                if not ok:
+                    raise RuntimeError("Background preview could not be encoded")
+                jpeg = encoded.tobytes()
+            pending_dir.mkdir(parents=True, exist_ok=True)
+            pending_path.write_bytes(generated)
+            project_manager.update_status(
+                req.project_id,
+                pending_edit_preview={
+                    "edit_type": req.edit_type,
+                    "frame_index": req.frame_index,
+                    "prompt": req.prompt or "",
+                },
+            )
+        else:
+            pending_path.unlink(missing_ok=True)
+            project_manager.update_status(req.project_id, pending_edit_preview=None)
+            jpeg = await asyncio.to_thread(
+                preview_service.render_preview,
+                req.project_id, req.frame_index, req.edit_type,
+                color=req.color, blur_strength=req.blur_strength,
+                scale=req.scale, dx=req.dx or 0, dy=req.dy or 0)
     except (ValueError, FileNotFoundError, RuntimeError) as e:
         from fastapi.responses import JSONResponse
         return JSONResponse({"error": str(e)}, status_code=400)

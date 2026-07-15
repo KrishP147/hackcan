@@ -35,10 +35,13 @@ def _project_dir(project_id: str) -> Path:
 def _ensure_flows(project_dir: Path, start: int, end: int):
     """RAFT flow on original footage — cached once per project, cheap on re-edit.
     Restricted to the pairs this edit can touch (range + inpaint donor margin)."""
-    flow_service.compute_flows(project_dir / "frames", project_dir / "flows",
-                               device=config.get_device(),
-                               start=max(1, start - INPAINT_MARGIN),
-                               end=end + INPAINT_MARGIN)
+    with config.gpu_job(f"raft:{project_dir.name}"):
+        flow_service.compute_flows(
+            project_dir / "frames", project_dir / "flows",
+            device=config.get_device(),
+            start=max(1, start - INPAINT_MARGIN),
+            end=end + INPAINT_MARGIN,
+        )
 
 
 def _ensure_masks(project_id: str, project_dir: Path, start: int, end: int,
@@ -50,6 +53,10 @@ def _ensure_masks(project_id: str, project_dir: Path, start: int, end: int,
     if not missing:
         return
     status = project_manager.get_status(project_id)
+    if status.get("segment_status") == "keyframe_ready":
+        raise RuntimeError(
+            "Confirm mask tracking before applying this edit to other frames"
+        )
     anchor = status.get("anchor_frame")
     anchor_mask_path = masks_dir / f"mask_{anchor:04d}.png" if anchor else None
     if not anchor or not anchor_mask_path.exists():
@@ -57,10 +64,11 @@ def _ensure_masks(project_id: str, project_dir: Path, start: int, end: int,
     from PIL import Image
     anchor_mask = (np.array(Image.open(anchor_mask_path).convert("L")) > 128)
     from services import sam2_service
-    sam2_service.propagate_masks(
-        project_dir / "frames", anchor, anchor_mask, masks_dir,
-        click_x=status.get("click_x"), click_y=status.get("click_y"),
-        frame_step=config.get_mask_frame_step(), cancel_check=cancel_check)
+    with config.gpu_job(f"sam2:tracking:{project_id}"):
+        sam2_service.propagate_masks(
+            project_dir / "frames", anchor, anchor_mask, masks_dir,
+            click_x=status.get("click_x"), click_y=status.get("click_y"),
+            frame_step=config.get_mask_frame_step(), cancel_check=cancel_check)
     mask_service.stabilize_masks(masks_dir)
     project_manager.update_status(
         project_id,
@@ -119,13 +127,15 @@ def _run_deterministic(rule, project_dir: Path, ordered: list[int], sweep: _Swee
         sweep.frame_done(t)
 
 
-async def run_edit_rule(project_id: str, rule, progress_cb=None, cancel_check=None) -> None:
+async def run_edit_rule(
+    project_id: str, rule, progress_cb=None, cancel_check=None, generate=None
+) -> None:
     project_dir = _project_dir(project_id)
     device = config.get_device()
     loop = asyncio.get_running_loop()
     indices = list(range(rule.start_frame, rule.end_frame + 1))
     status = project_manager.get_status(project_id)
-    anchor = status.get("anchor_frame") or rule.start_frame
+    anchor = getattr(rule, "preview_frame", None) or status.get("anchor_frame") or rule.start_frame
     anchor = min(max(anchor, rule.start_frame), rule.end_frame)
     center = getattr(rule, "preview_frame", None) or anchor
     center = min(max(center, rule.start_frame), rule.end_frame)
@@ -164,15 +174,18 @@ async def run_edit_rule(project_id: str, rule, progress_cb=None, cancel_check=No
                                 sweep.frame_done)
     elif rule.edit_type == "bg_replace":
         await background_tool.apply_background_replace_range(
-            project_dir, indices, anchor, rule.prompt or "", device)
+            project_dir, indices, anchor, rule.prompt or "", device,
+            generate=generate)
     elif rule.edit_type == "replace":
         if config.USE_SYNTH or (getattr(rule, "backend", None) == "B"):
             from services import synth_propagation_service
             await synth_propagation_service.apply_replace_range(
-                project_dir, indices, anchor, rule.prompt or "", device)
+                project_dir, indices, anchor, rule.prompt or "", device,
+                generate=generate)
         else:
             await replace_tool.apply_replace_range(
-                project_dir, indices, anchor, rule.prompt or "", device)
+                project_dir, indices, anchor, rule.prompt or "", device,
+                generate=generate)
     else:
         raise ValueError(f"Unknown edit_type: {rule.edit_type}")
     if progress_cb:

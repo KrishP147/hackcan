@@ -27,6 +27,7 @@ export default function EditorPage() {
     videoLoaded: editor.videoLoaded,
     status: editor.videoLoaded ? "ready" : "created",
     thumbnailUrl: editor.storageBaseUrl ? `${editor.storageBaseUrl}/frame_0001.jpg` : null,
+    name: editor.videoName,
   });
 
   // Set current project in Zustand when page loads
@@ -109,6 +110,8 @@ export default function EditorPage() {
           detections={editor.detections}
           isDetecting={editor.isDetecting}
           isSegmenting={editor.isSegmenting}
+          segmentStatus={editor.segmentStatus}
+          segmentAnchorFrame={editor.segmentAnchorFrame}
           maskCount={editor.maskCount}
           maskVersion={editor.maskVersion}
           editVersion={editor.editVersion}
@@ -131,6 +134,7 @@ export default function EditorPage() {
           onUpload={editor.loadVideo}
           onApplyEdit={editor.applyEditAction}
           onSegmentAtPoint={editor.segmentAtPoint}
+          onConfirmPropagation={editor.confirmSegmentPropagation}
           onCancelEdit={editor.cancelEdit}
         />
 
@@ -140,7 +144,7 @@ export default function EditorPage() {
               ? editor.detections.find((d) => d.id === editor.selectedObjectId)?.label || "object"
               : "selection"
           }
-          active={!editor.isSegmenting && !editor.isProcessing && editor.videoLoaded}
+          active={!editor.isSegmenting && !editor.isProcessing && editor.videoLoaded && editor.segmentStatus !== "keyframe_ready"}
           hasMask={editor.maskCount > 0}
           editApplied={editor.editVersion > 0}
           onApply={editor.applyEditAction}

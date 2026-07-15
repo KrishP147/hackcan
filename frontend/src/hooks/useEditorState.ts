@@ -33,6 +33,8 @@ interface EditorState {
   detections: Detection[];
   isDetecting: boolean;
   isSegmenting: boolean;
+  segmentStatus: string | null;
+  segmentAnchorFrame: number | null;
   maskCount: number;
   maskVersion: number;
   editVersion: number;
@@ -100,6 +102,8 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
     detections: [],
     isDetecting: false,
     isSegmenting: false,
+    segmentStatus: null,
+    segmentAnchorFrame: null,
     maskCount: 0,
     maskVersion: 0,
     editVersion: 0,
@@ -216,6 +220,7 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
           const segmentingStatus = SEGMENTING_STATUSES.has(segmentStatusImmediate);
           const segmentError = segmentStatusImmediate === "error" ? status.segment_error : null;
           const isDone = segmentStatusImmediate === "done";
+          const isKeyframeReady = segmentStatusImmediate === "keyframe_ready";
 
           console.log("[Frontend] Immediate segmentation status update:", {
             segment_status: segmentStatusImmediate,
@@ -230,7 +235,11 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
               ? status.mask_count
               : s.maskCount;
             // Increment maskVersion when done to force refresh
-            const shouldIncrementMaskVersion = isDone && (newMaskCount > s.maskCount || s.maskVersion === 0);
+            const shouldIncrementMaskVersion = (isDone || isKeyframeReady) && (
+              newMaskCount > s.maskCount ||
+              s.maskVersion === 0 ||
+              s.segmentStatus !== segmentStatusImmediate
+            );
 
             console.log("[Frontend] Updating segmentation state (immediate):", {
               oldMaskCount: s.maskCount,
@@ -244,6 +253,8 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
             return {
               ...s,
               isSegmenting: segmentingStatus,
+              segmentStatus: segmentStatusImmediate,
+              segmentAnchorFrame: status.anchor_frame ?? s.segmentAnchorFrame,
               maskCount: newMaskCount,
               maskVersion: shouldIncrementMaskVersion ? s.maskVersion + 1 : s.maskVersion,
               showToast: segmentError ? true : s.showToast,
@@ -313,7 +324,9 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
               editRangeEnd: s.editRangeEnd === 0 ? frameCount - 1 : s.editRangeEnd,
               isDetecting: !!status.detecting,
               // Use segmentStatus to determine isSegmenting - only true if actively segmenting
-              isSegmenting: segmentStatus === "segmenting",
+              isSegmenting: SEGMENTING_STATUSES.has(segmentStatus || ""),
+              segmentStatus: segmentStatus ?? s.segmentStatus,
+              segmentAnchorFrame: status.anchor_frame ?? s.segmentAnchorFrame,
               maskCount: maskCountFromStatus,
               storageBaseUrl: status.storage_base_url || s.storageBaseUrl,
             }));
@@ -329,6 +342,7 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
             const segmentingStatus = SEGMENTING_STATUSES.has(segmentStatus);
               const segmentError = segmentStatus === "error" ? status.segment_error : null;
               const isDone = segmentStatus === "done";
+              const isKeyframeReady = segmentStatus === "keyframe_ready";
 
               console.log("[Frontend] Segmentation status update:", {
                 segment_status: segmentStatus,
@@ -344,7 +358,11 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
                   : s.maskCount;
                 // Increment maskVersion when segmentation completes to force mask refresh
                 // Also increment on page reload if masks exist to ensure display refreshes
-                const shouldIncrementMaskVersion = isDone && (newMaskCount > s.maskCount || s.maskVersion === 0);
+                const shouldIncrementMaskVersion = (isDone || isKeyframeReady) && (
+                  newMaskCount > s.maskCount ||
+                  s.maskVersion === 0 ||
+                  s.segmentStatus !== segmentStatus
+                );
 
                 console.log("[Frontend] Updating segmentation state:", {
                   oldMaskCount: s.maskCount,
@@ -357,6 +375,8 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
                 return {
                   ...s,
                   isSegmenting: segmentingStatus,
+                  segmentStatus,
+                  segmentAnchorFrame: status.anchor_frame ?? s.segmentAnchorFrame,
                   maskCount: newMaskCount,
                   maskVersion: shouldIncrementMaskVersion ? s.maskVersion + 1 : s.maskVersion,
                   showToast: segmentError ? true : s.showToast,
@@ -556,13 +576,20 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
 
           if (segStatus !== undefined) {
             const isDone = segStatus === "done";
+            const isKeyframeReady = segStatus === "keyframe_ready";
             setState((s) => {
               const newMaskCount = status.mask_count !== undefined && status.mask_count !== null
                 ? status.mask_count : s.maskCount;
-              const shouldIncrementMaskVersion = isDone && (newMaskCount > s.maskCount || s.maskVersion === 0);
+              const shouldIncrementMaskVersion = (isDone || isKeyframeReady) && (
+                newMaskCount > s.maskCount ||
+                s.maskVersion === 0 ||
+                s.segmentStatus !== segStatus
+              );
               return {
                 ...s,
                 isSegmenting: SEGMENTING_STATUSES.has(segStatus),
+                segmentStatus: segStatus,
+                segmentAnchorFrame: status.anchor_frame ?? s.segmentAnchorFrame,
                 maskCount: newMaskCount,
                 maskVersion: shouldIncrementMaskVersion ? s.maskVersion + 1 : s.maskVersion,
                 showToast: status.segment_status === "error" ? true : s.showToast,
@@ -718,12 +745,49 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
     setState((s) => ({
       ...s,
       isSegmenting: true,
+      segmentStatus: "segmenting",
+      segmentAnchorFrame: frameIndex,
       isProcessing: false,
       maskCount: 0,
       selectedObjectId: null,
       showEditPanel: false,
     }));
   }, [projectId, restartPolling, state.aiEditStatus, state.currentFrame, state.isProcessing, state.isSegmenting, state.projectId]);
+
+  const confirmSegmentPropagation = useCallback(() => {
+    const currentProjectId = projectId ?? state.projectId;
+    if (!currentProjectId || state.segmentStatus !== "keyframe_ready" || state.isSegmenting) return;
+
+    setState((s) => ({ ...s, isSegmenting: true, segmentStatus: "propagating" }));
+    fetch(`${API_URL}/segment/propagate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project_id: currentProjectId }),
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.error) {
+          setState((s) => ({
+            ...s,
+            isSegmenting: false,
+            segmentStatus: "keyframe_ready",
+            showToast: true,
+            toastMessage: data.error,
+          }));
+          return;
+        }
+        restartPolling(500);
+      })
+      .catch((error) => {
+        setState((s) => ({
+          ...s,
+          isSegmenting: false,
+          segmentStatus: "keyframe_ready",
+          showToast: true,
+          toastMessage: `Mask tracking failed: ${error.message}`,
+        }));
+      });
+  }, [projectId, restartPolling, state.isSegmenting, state.projectId, state.segmentStatus]);
 
   const selectObject = useCallback((id: string | null) => {
     if (id !== null && state.frameWidth > 0 && state.frameHeight > 0) {
@@ -1091,6 +1155,7 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
     loadVideo,
     detectObjects,
     segmentAtPoint,
+    confirmSegmentPropagation,
     selectObject,
     setEditMode,
     updateEditParams,

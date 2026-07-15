@@ -76,6 +76,21 @@ export const useVideoStore = create<VideoStore>()(
     }),
     {
       name: "video-storage", // localStorage key
+      // Clear the pre-auth development history once. Those entries used the
+      // retired short project IDs and cannot reliably map to Modal/Supabase.
+      // New uploads are persisted normally under version 1.
+      version: 1,
+      migrate: (persistedState, version) => {
+        const state = persistedState as VideoStore;
+        if (version < 1) {
+          return {
+            ...state,
+            projects: [],
+            currentProjectId: null,
+          };
+        }
+        return state;
+      },
     }
   )
 );

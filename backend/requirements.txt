@@ -14,8 +14,11 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 python-multipart==0.0.20
 python-dotenv==1.0.1
-pydantic==2.10.4
+pydantic==2.13.4
 httpx==0.28.1
+
+# Gemini keyframe generation (replace / background replace)
+google-genai==2.11.0
 
 # Auth0 JWT validation
 python-jose[cryptography]==3.5.0

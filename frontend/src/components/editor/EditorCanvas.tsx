@@ -13,6 +13,8 @@ interface EditorCanvasProps {
   detections: Detection[];
   isDetecting: boolean;
   isSegmenting: boolean;
+  segmentStatus: string | null;
+  segmentAnchorFrame: number | null;
   maskCount: number;
   maskVersion: number;
   editVersion: number;
@@ -35,6 +37,7 @@ interface EditorCanvasProps {
   onUpload: () => void;
   onApplyEdit: (action: EditAction, params: { color?: string; prompt?: string; scale?: number }) => void;
   onSegmentAtPoint: (clickX: number, clickY: number) => void;
+  onConfirmPropagation: () => void;
   onCancelEdit: () => void;
 }
 
@@ -44,6 +47,8 @@ export function EditorCanvas({
   detections,
   isDetecting,
   isSegmenting,
+  segmentStatus,
+  segmentAnchorFrame,
   maskCount,
   maskVersion,
   editVersion,
@@ -66,10 +71,14 @@ export function EditorCanvas({
   onUpload,
   onApplyEdit,
   onSegmentAtPoint,
+  onConfirmPropagation,
   onCancelEdit,
 }: EditorCanvasProps) {
   const imgRef = useRef<HTMLDivElement>(null);
   const borderCanvasRef = useRef<HTMLCanvasElement>(null);
+  const hasMaskForCurrentFrame = maskCount > 0 && (
+    segmentStatus === "done" || segmentAnchorFrame === currentFrame + 1
+  );
 
   const handleCanvasClick = useCallback(
     (e: React.MouseEvent) => {
@@ -91,13 +100,18 @@ export function EditorCanvas({
 
   // Draw border outline on canvas when mask exists
   useEffect(() => {
-    if (!borderCanvasRef.current || !projectId || maskCount === 0 || isSegmenting || aiEditStatus === "preview") {
+    if (!borderCanvasRef.current) {
       return;
     }
 
     const canvas = borderCanvasRef.current;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!projectId || !hasMaskForCurrentFrame || isSegmenting || aiEditStatus === "preview") {
+      return;
+    }
 
     // Set canvas size to match container
     const rect = canvas.getBoundingClientRect();
@@ -158,7 +172,7 @@ export function EditorCanvas({
       }
     };
     maskImg.src = `${API_URL}/mask/${projectId}/${currentFrame + 1}?v=${maskVersion}`;
-  }, [projectId, currentFrame, maskCount, maskVersion, isSegmenting, aiEditStatus, frameWidth, frameHeight]);
+  }, [projectId, currentFrame, hasMaskForCurrentFrame, maskVersion, isSegmenting, aiEditStatus, frameWidth, frameHeight]);
 
   if (!videoLoaded) {
     return <EmptyCanvas onUpload={onUpload} />;
@@ -203,7 +217,7 @@ export function EditorCanvas({
           }}
           onClick={handleCanvasClick}
         >
-          {!isSegmenting && maskCount === 0 && aiEditStatus !== "preview" && (
+          {!isSegmenting && !hasMaskForCurrentFrame && aiEditStatus !== "preview" && (
             <div className="absolute top-4 left-1/2 -translate-x-1/2 z-10 pointer-events-none rounded-xl border px-4 py-2 text-center backdrop-blur-md"
               style={{
                 background: "rgba(10, 10, 10, 0.72)",
@@ -244,7 +258,7 @@ export function EditorCanvas({
 
 
           {/* Hide masks and detections when showing AI preview */}
-          {aiEditStatus !== "preview" && projectId && maskCount > 0 && !isSegmenting && (
+          {aiEditStatus !== "preview" && projectId && hasMaskForCurrentFrame && !isSegmenting && (
             <>
               {/* Draw border outline on canvas - no mask overlay */}
               <canvas
@@ -263,7 +277,39 @@ export function EditorCanvas({
                 style={{ background: "rgba(0,0,0,0.7)", borderColor: "rgba(255,255,255,0.1)" }}
               >
                 <div className="w-6 h-6 border-2 border-[var(--accent)] border-t-transparent rounded-full animate-spin" />
-                <span className="text-white/70 text-xs font-medium">Segmenting…</span>
+                <span className="text-white/70 text-xs font-medium">
+                  {segmentStatus === "propagating" ? "Tracking object through video…" : "Segmenting keyframe…"}
+                </span>
+              </div>
+            </div>
+          )}
+
+          {segmentStatus === "keyframe_ready" && !isSegmenting && (
+            <div
+              className="absolute bottom-4 left-1/2 -translate-x-1/2 z-30 w-[360px] rounded-2xl border p-4 shadow-2xl backdrop-blur-xl"
+              style={{ background: "rgba(15,15,18,0.92)", borderColor: "rgba(255,255,255,0.14)" }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="flex items-start gap-3">
+                <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-400">
+                  ✓
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-semibold text-white">Keyframe selection ready</p>
+                  <p className="mt-1 text-xs leading-5 text-white/60">
+                    Track this object through all {totalFrames} frames?
+                  </p>
+                  <button
+                    type="button"
+                    onClick={onConfirmPropagation}
+                    className="mt-3 w-full rounded-xl bg-[var(--accent)] px-4 py-2.5 text-xs font-semibold text-white transition hover:brightness-110"
+                  >
+                    Segment all frames
+                  </button>
+                  <p className="mt-2 text-center text-[10px] text-white/40">
+                    Or click another point to adjust the selection
+                  </p>
+                </div>
               </div>
             </div>
           )}

@@ -33,3 +33,17 @@ def test_replace_routes_to_propagation_engine(tmp_project):
         rep.assert_awaited_once()
         args = rep.await_args.args
         assert "a dog" in args
+
+
+def test_replace_backend_b_routes_to_guided_synthesis(tmp_project):
+    with patch.object(edit_dispatch, "_ensure_flows"), \
+         patch.object(edit_dispatch, "_ensure_masks"), \
+         patch.object(edit_dispatch, "_project_dir", return_value=tmp_project), \
+         patch.object(edit_dispatch.project_manager, "get_status", return_value={}), \
+         patch("services.synth_propagation_service.apply_replace_range",
+               new_callable=AsyncMock) as synth:
+        asyncio.run(edit_dispatch.run_edit_rule(
+            "pid", _rule(edit_type="replace", prompt="a dog", backend="B")))
+        synth.assert_awaited_once()
+        args = synth.await_args.args
+        assert "a dog" in args

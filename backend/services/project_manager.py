@@ -21,7 +21,9 @@ def _get_lock(project_id: str) -> threading.Lock:
 
 
 def create_project() -> dict:
-    project_id = str(uuid.uuid4())[:8]
+    # The ID is also the guest project's bearer capability in public editor
+    # URLs, so retain the full 128 bits instead of the old 8-character prefix.
+    project_id = uuid.uuid4().hex
     project_dir = BASE_DIR / project_id
     project_dir.mkdir(parents=True, exist_ok=True)
     (project_dir / "frames").mkdir(exist_ok=True)

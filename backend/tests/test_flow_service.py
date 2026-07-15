@@ -9,6 +9,13 @@ from services import flow_service
 from services.flow_service import warp, compose_flow, fb_check
 
 
+@pytest.fixture(autouse=True)
+def reset_raft_cache():
+    flow_service.reset_raft_model()
+    yield
+    flow_service.reset_raft_model()
+
+
 def const_flow(dx, dy, h=32, w=48):
     f = torch.zeros(1, 2, h, w)
     f[:, 0] = dx
@@ -73,6 +80,27 @@ def test_compute_flows_caches_all_pairs(tmp_project, monkeypatch):
     assert (tmp_project / "flows" / "flow_bwd_0002.npy").exists()
     f = flow_service.load_flow(tmp_project / "flows", 1, "fwd")
     assert f.shape[1] == 2 and abs(f[:, 0].mean().item() + 2.0) < 1e-3
+
+
+def test_compute_flows_batches_adjacent_pairs(tmp_project, monkeypatch):
+    _write_frames(tmp_project / "frames", n=5)
+    batch_calls = []
+
+    class FakeRaft:
+        def __call__(self, a, b, num_flow_updates=12):
+            batch_calls.append(a.shape[0])
+            return [torch.zeros(a.shape[0], 2, a.shape[2], a.shape[3])]
+
+    monkeypatch.setattr(flow_service, "_build_raft", lambda device: FakeRaft())
+    pairs = flow_service.compute_flows(
+        tmp_project / "frames",
+        tmp_project / "flows",
+        device=torch.device("cpu"),
+        batch_size=2,
+    )
+
+    assert pairs == 4
+    assert batch_calls == [2, 2, 2, 2]  # forward + backward for two chunks
 
 
 @pytest.mark.slow

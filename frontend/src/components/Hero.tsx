@@ -1,7 +1,6 @@
 "use client";
 
 import { DropZone } from "./DropZone";
-import { DemoVideo } from "./DemoVideo";
 import { RotatingWord } from "./RotatingWord";
 
 export function Hero() {
@@ -30,11 +29,6 @@ export function Hero() {
       {/* ── Drop zone ── */}
       <div className="animate-fade-up stagger-3 w-full px-6 md:px-12 max-w-2xl pb-10">
         <DropZone />
-      </div>
-
-      {/* ── Large demo video — top visible at page load ── */}
-      <div className="w-full px-4 md:px-6 lg:px-8 pb-16">
-        <DemoVideo />
       </div>
 
     </section>
