@@ -1,4 +1,5 @@
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, Depends, HTTPException
+from fastapi import (FastAPI, UploadFile, File, BackgroundTasks, Depends,
+                     HTTPException, Header)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from dotenv import load_dotenv
@@ -15,10 +16,20 @@ import math
 from functools import partial
 import numpy as np
 import uuid
+import json
+import os
+import re
+import secrets
+import tarfile
+import tempfile
 from pathlib import Path
 from io import BytesIO
+from urllib.parse import urlparse
 
-from services import project_manager, ffmpeg_service, sam2_service, config
+import httpx
+
+from services import (project_manager, ffmpeg_service, sam2_service, config,
+                      supabase_storage_service)
 from services.auth_service import get_current_user, is_auth0_configured
 # film_service  # FILM disabled - using RIFE instead
 
@@ -76,6 +87,7 @@ async def health():
 # --- Upload ---
 
 MAX_UPLOAD_DURATION_SECONDS = 6.0
+PROJECT_ID_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 
 
 def _validate_upload_duration(video_path: Path) -> float:
@@ -102,6 +114,137 @@ def _validate_upload_duration(video_path: Path) -> float:
         )
 
     return duration
+
+
+class ImportProjectRequest(BaseModel):
+    project_id: str
+    source_url: str
+    checkpoint_url: str | None = None
+    user_id: str | None = None
+    original_path: str | None = None
+    current_path: str | None = None
+    checkpoint_path: str | None = None
+
+
+def _validate_storage_url(value: str) -> None:
+    expected_host = urlparse(os.getenv("SUPABASE_URL", "")).hostname
+    parsed = urlparse(value)
+    if (not expected_host or parsed.scheme != "https" or
+            parsed.hostname != expected_host or
+            not parsed.path.startswith("/storage/v1/object/sign/")):
+        raise ValueError("Only signed URLs from the configured Supabase project are allowed")
+
+
+def _download_signed_object(url: str, destination: Path) -> None:
+    _validate_storage_url(url)
+    temporary = destination.with_suffix(destination.suffix + ".download")
+    with httpx.stream("GET", url, follow_redirects=True, timeout=180.0) as response:
+        response.raise_for_status()
+        with temporary.open("wb") as output:
+            for chunk in response.iter_bytes():
+                output.write(chunk)
+    temporary.replace(destination)
+
+
+def _restore_checkpoint(project_id: str, checkpoint_url: str) -> None:
+    project_dir = project_manager.get_project_dir(project_id)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        archive_path = Path(temp_dir) / "checkpoint.tar.gz"
+        _download_signed_object(checkpoint_url, archive_path)
+        with tarfile.open(archive_path, "r:gz") as archive:
+            status_member = archive.getmember("status.json") if "status.json" in archive.getnames() else None
+            if status_member:
+                status_file = archive.extractfile(status_member)
+                if status_file:
+                    saved = json.load(status_file)
+                    restorable = {
+                        key: saved[key]
+                        for key in (
+                            "anchor_frame", "click_x", "click_y", "mask_count",
+                            "segment_status", "edit_version", "flow_status",
+                        )
+                        if key in saved
+                    }
+                    project_manager.update_status(project_id, **restorable)
+
+            masks_dir = project_dir / "masks"
+            masks_dir.mkdir(exist_ok=True)
+            for member in archive.getmembers():
+                if not member.isfile() or not re.fullmatch(r"masks/mask_\d{4}\.png", member.name):
+                    continue
+                source = archive.extractfile(member)
+                if source:
+                    (masks_dir / Path(member.name).name).write_bytes(source.read())
+
+
+def _background_import_project(req: ImportProjectRequest) -> None:
+    try:
+        project = project_manager.create_project(req.project_id)
+        project_dir = Path(project["project_dir"])
+        project_manager.update_status(
+            req.project_id,
+            status="hydrating",
+            user_id=req.user_id,
+            storage_original_path=req.original_path,
+            storage_current_path=req.current_path,
+            storage_checkpoint_path=req.checkpoint_path,
+            error=None,
+        )
+        video_path = project_dir / "original.mp4"
+        _download_signed_object(req.source_url, video_path)
+        duration = _validate_upload_duration(video_path)
+        project_manager.update_status(req.project_id, duration=duration)
+
+        if req.checkpoint_url:
+            _restore_checkpoint(req.project_id, req.checkpoint_url)
+
+        # A hydrated cache is immediately made editor-ready. The browser does
+        # not need to issue a second upload or extraction request.
+        _background_extract(req.project_id)
+    except Exception as exc:
+        print(f"[import] project hydration failed for {req.project_id}: {exc}")
+        try:
+            project_manager.update_status(
+                req.project_id, status="error", error=f"Storage hydration failed: {exc}")
+        except Exception:
+            pass
+
+
+@app.post("/project/import", status_code=202)
+async def import_project_from_storage(
+    req: ImportProjectRequest,
+    background_tasks: BackgroundTasks,
+    x_frameshift_import_secret: str | None = Header(default=None),
+):
+    configured_secret = os.getenv("FRAMESHIFT_IMPORT_SECRET", "")
+    if not configured_secret:
+        raise HTTPException(status_code=503, detail="Storage hydration is not configured")
+    if not x_frameshift_import_secret or not secrets.compare_digest(
+        x_frameshift_import_secret, configured_secret
+    ):
+        raise HTTPException(status_code=401, detail="Invalid storage hydration secret")
+    if not PROJECT_ID_PATTERN.fullmatch(req.project_id):
+        raise HTTPException(status_code=400, detail="Invalid project_id")
+    try:
+        _validate_storage_url(req.source_url)
+        if req.checkpoint_url:
+            _validate_storage_url(req.checkpoint_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    existing_status = project_manager.get_status(req.project_id)
+    try:
+        existing_dir = project_manager.get_project_dir(req.project_id)
+        if (existing_status.get("status") == "ready" and
+                any((existing_dir / "frames").glob("frame_*.jpg"))):
+            return {"project_id": req.project_id, "status": "ready", "cache": "hit"}
+    except FileNotFoundError:
+        pass
+
+    project_manager.create_project(req.project_id)
+    project_manager.update_status(req.project_id, status="hydrating", error=None)
+    background_tasks.add_task(_background_import_project, req)
+    return {"project_id": req.project_id, "status": "hydrating", "cache": "miss"}
 
 @app.post("/upload")
 async def upload_video(
@@ -169,6 +312,9 @@ def _background_extract(project_id: str):
                                    fps=used_fps,
                                    frame_width=frame_width, frame_height=frame_height,
                                    detecting=False, detections={})
+
+    # Durable media lives in Supabase. The Volume remains only a fast cache.
+    supabase_storage_service.sync_extract_metadata(project_id)
 
     # Flow is lazy by default. Starting RAFT here used to contend with SAM2 as
     # soon as the user clicked an object. It can still be enabled explicitly
@@ -406,6 +552,7 @@ async def _background_propagate_segment(project_id: str):
             mask_count=mask_count,
             segment_error=None,
         )
+        await asyncio.to_thread(supabase_storage_service.sync_checkpoint, project_id)
         print(f"[SAM2] Full mask propagation complete: {mask_count} frames")
     except sam2_service.PropagationCancelled:
         project_manager.update_status(
@@ -680,6 +827,7 @@ async def _background_edit(project_id: str, edit_rules: List[EditRule]):
             edit_progress={"done": total_frames, "total": total_frames},
             edit_version=(project_manager.get_status(project_id).get("edit_version", 0) or 0) + 1,
         )
+        await asyncio.to_thread(supabase_storage_service.sync_current_video, project_id)
     except Exception as e:
         from services import edit_dispatch, sam2_service
         if isinstance(e, (edit_dispatch.EditCancelled, sam2_service.PropagationCancelled)):
@@ -730,6 +878,7 @@ async def undo_edit(req: UndoRequest):
         last_backup_timestamp=None,  # Clear backup after undo
         last_backup_frames=[],
     )
+    await asyncio.to_thread(supabase_storage_service.sync_current_video, req.project_id)
     
     return {
         "status": "success",
@@ -897,6 +1046,9 @@ async def render_video(req: RenderRequest):
             ffmpeg_service.encode_video(frames_dir, output_path, fps=fps)
         else:
             ffmpeg_service.encode_video(edited_dir, output_path, fps=fps)
+
+    await asyncio.to_thread(
+        supabase_storage_service.sync_export, req.project_id, output_path)
 
     # Return local file path
     return {

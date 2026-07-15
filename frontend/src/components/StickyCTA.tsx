@@ -3,6 +3,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { AlertCircle, Clock3, Upload, Loader2 } from "lucide-react";
+import { getAccessToken } from "@auth0/nextjs-auth0/client";
+import { useVideoStore } from "@/stores/videoStore";
 import {
   MAX_VIDEO_DURATION_SECONDS,
   validateVideoUpload,
@@ -16,6 +18,8 @@ export function StickyCTA() {
   const [error, setError] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const router = useRouter();
+  const addProject = useVideoStore((state) => state.addProject);
+  const setCurrentProject = useVideoStore((state) => state.setCurrentProject);
 
   useEffect(() => {
     const dropZone = document.querySelector("[data-dropzone]");
@@ -36,11 +40,41 @@ export function StickyCTA() {
       await validateVideoUpload(file);
       const formData = new FormData();
       formData.append("file", file);
-      const res = await fetch(`${API_URL}/upload`, { method: "POST", body: formData });
+
+      const headers: HeadersInit = {};
+      try {
+        const token = await getAccessToken();
+        if (token) headers.Authorization = `Bearer ${token}`;
+      } catch {
+        // Guest uploads remain supported.
+      }
+
+      const res = await fetch(`${API_URL}/upload`, {
+        method: "POST",
+        headers,
+        body: formData,
+      });
       const data = await res.json();
       if (!res.ok || !data.project_id) {
         throw new Error(data.detail || data.error || "Upload failed");
       }
+
+      addProject({
+        projectId: data.project_id,
+        videoName: file.name,
+        uploadedAt: Date.now(),
+        status: "created",
+      });
+      setCurrentProject(data.project_id);
+
+      // Signed-in users get durable cross-device history. Guests simply get a
+      // 401 here and continue using local browser history.
+      await fetch("/api/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project_id: data.project_id, name: file.name }),
+      }).catch(() => {});
+
       router.push(`/editor/${data.project_id}`);
     } catch (uploadError) {
       setUploading(false);

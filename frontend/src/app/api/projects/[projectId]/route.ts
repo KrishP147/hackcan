@@ -2,6 +2,29 @@ import { NextRequest, NextResponse } from "next/server";
 import { auth0 } from "@/lib/auth0";
 import { supabaseAdmin } from "@/lib/supabase";
 
+export async function GET(
+  _req: NextRequest,
+  { params }: { params: Promise<{ projectId: string }> }
+) {
+  if (!supabaseAdmin) {
+    return NextResponse.json({ error: "Project sync is not configured" }, { status: 503 });
+  }
+  const session = await auth0.getSession();
+  if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+  const { projectId } = await params;
+  const { data, error } = await supabaseAdmin
+    .from("projects")
+    .select("*")
+    .eq("project_id", projectId)
+    .eq("user_id", session.user.sub)
+    .maybeSingle();
+
+  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (!data) return NextResponse.json({ error: "Project not found" }, { status: 404 });
+  return NextResponse.json(data);
+}
+
 export async function PATCH(
   req: NextRequest,
   { params }: { params: Promise<{ projectId: string }> }

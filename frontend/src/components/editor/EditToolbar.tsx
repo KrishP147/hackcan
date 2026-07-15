@@ -11,6 +11,7 @@ import {
   Droplet,
   Sun,
   RefreshCw,
+  Info,
 } from "lucide-react";
 
 export type EditAction =
@@ -180,6 +181,23 @@ export function EditToolbar({ objectLabel, active, hasMask, editApplied, onApply
                 </button>
               );
             })}
+          </div>
+
+          <div
+            className="mt-4 flex gap-2 rounded-xl border px-2.5 py-2.5"
+            style={{
+              background: "var(--ed-surface-2)",
+              borderColor: "var(--ed-border)",
+              color: "var(--ed-subtle)",
+            }}
+          >
+            <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+            <p className="text-[10px] leading-4">
+              <span className="font-semibold" style={{ color: "var(--ed-muted)" }}>
+                {editApplied ? "Edit saved — keep going." : "You can stack edits."}
+              </span>{" "}
+              After propagation, choose another tool. Its preview starts from your latest edited result.
+            </p>
           </div>
 
         </div>

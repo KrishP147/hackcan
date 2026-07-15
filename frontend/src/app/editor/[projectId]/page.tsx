@@ -13,12 +13,15 @@ import { useEffect, useRef, useState } from "react";
 import { useParams, useSearchParams } from "next/navigation";
 import { useVideoStore } from "@/stores/videoStore";
 
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
 export default function EditorPage() {
   const params = useParams();
   const searchParams = useSearchParams();
   const projectId = params.projectId as string;
   const initialFrame = Number(searchParams.get("frame") ?? 0);
   const setCurrentProject = useVideoStore((state) => state.setCurrentProject);
+  const addProject = useVideoStore((state) => state.addProject);
   const editor = useEditorState(projectId, initialFrame);
 
   useProjectSync({
@@ -26,9 +29,42 @@ export default function EditorPage() {
     currentFrame: editor.currentFrame,
     videoLoaded: editor.videoLoaded,
     status: editor.videoLoaded ? "ready" : "created",
-    thumbnailUrl: editor.storageBaseUrl ? `${editor.storageBaseUrl}/frame_0001.jpg` : null,
+    thumbnailUrl: editor.videoLoaded ? `${API_URL}/frame/${projectId}/1` : null,
     name: editor.videoName,
   });
+
+  // Hydrate account metadata before the polling fallback can permanently use
+  // the raw project id as a title. This also restores the saved playhead when
+  // an editor URL is opened directly instead of through the dashboard card.
+  useEffect(() => {
+    if (!projectId) return;
+    let active = true;
+
+    void fetch(`/api/projects/${projectId}`).then(async (response) => {
+      if (!response.ok || !active) return;
+      const project = await response.json();
+      if (!active) return;
+
+      const projectName = typeof project.name === "string" && project.name.trim()
+        ? project.name
+        : "Untitled Project";
+      editor.setVideoName(projectName);
+      addProject({
+        projectId,
+        videoName: projectName,
+        uploadedAt: Date.parse(project.created_at) || Date.now(),
+        status: project.status,
+      });
+
+      if (!searchParams.has("frame") && Number.isInteger(project.last_frame)) {
+        editor.setCurrentFrame(Math.max(0, project.last_frame));
+      }
+    }).catch(() => {});
+
+    return () => {
+      active = false;
+    };
+  }, [addProject, editor.setCurrentFrame, editor.setVideoName, projectId, searchParams]);
 
   // Set current project in Zustand when page loads
   useEffect(() => {

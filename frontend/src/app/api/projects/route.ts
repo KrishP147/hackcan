@@ -38,7 +38,7 @@ export async function POST(req: NextRequest) {
   const userId = session.user.sub;
   const safeName = typeof name === "string" && name.trim()
     ? name.trim().slice(0, 255)
-    : "Untitled Project";
+    : null;
   const safeThumbnail = typeof thumbnail_url === "string"
     ? thumbnail_url.slice(0, 2048)
     : null;
@@ -59,9 +59,19 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Project already belongs to another user" }, { status: 409 });
   }
   if (existing) {
+    const updates: { name?: string; thumbnail_url?: string } = {};
+    if (safeName) updates.name = safeName;
+    if (safeThumbnail) updates.thumbnail_url = safeThumbnail;
+
+    // Opening an existing project often happens before its client-side name
+    // has been hydrated. Do not replace durable metadata with a fallback.
+    if (Object.keys(updates).length === 0) {
+      return NextResponse.json(existing);
+    }
+
     const { data, error } = await supabaseAdmin
       .from("projects")
-      .update({ name: safeName, thumbnail_url: safeThumbnail ?? existing.thumbnail_url })
+      .update(updates)
       .eq("project_id", project_id)
       .eq("user_id", userId)
       .select()
@@ -75,7 +85,7 @@ export async function POST(req: NextRequest) {
     .insert({
       project_id,
       user_id: userId,
-      name: safeName,
+      name: safeName ?? "Untitled Project",
       thumbnail_url: safeThumbnail,
       status: "created",
       last_frame: 0,
