@@ -138,7 +138,7 @@ export default function EditorPage() {
               ? editor.detections.find((d) => d.id === editor.selectedObjectId)?.label || "object"
               : "selection"
           }
-          active={!editor.isSegmenting && editor.videoLoaded}
+          active={!editor.isSegmenting && !editor.isProcessing && editor.videoLoaded}
           hasMask={editor.maskCount > 0}
           editApplied={editor.editVersion > 0}
           onApply={editor.applyEditAction}

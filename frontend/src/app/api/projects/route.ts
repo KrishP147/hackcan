@@ -3,6 +3,9 @@ import { auth0 } from "@/lib/auth0";
 import { supabaseAdmin } from "@/lib/supabase";
 
 export async function GET() {
+  if (!supabaseAdmin) {
+    return NextResponse.json({ error: "Project sync is not configured" }, { status: 503 });
+  }
   const session = await auth0.getSession();
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
@@ -17,6 +20,9 @@ export async function GET() {
 }
 
 export async function POST(req: NextRequest) {
+  if (!supabaseAdmin) {
+    return NextResponse.json({ error: "Project sync is not configured" }, { status: 503 });
+  }
   const session = await auth0.getSession();
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 

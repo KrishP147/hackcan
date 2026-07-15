@@ -2,7 +2,7 @@
 
 import { useCallback, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Upload, Loader2 } from "lucide-react";
+import { Upload, Loader2, Play } from "lucide-react";
 import { useVideoStore } from "@/stores/videoStore";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -16,36 +16,58 @@ export function DropZone() {
   const [status, setStatus] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  function registerProject(projectId: string, name: string) {
+    return fetch("/api/projects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project_id: projectId,
+        name,
+        thumbnail_url: null,
+      }),
+    }).catch(() => { });
+  }
+
   async function uploadFile(file: File) {
     setUploading(true);
     setStatus("Uploading video...");
 
-    const formData = new FormData();
-    formData.append("file", file);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
 
-    const res = await fetch(`${API_URL}/upload`, { method: "POST", body: formData });
-    const data = await res.json();
+      const res = await fetch(`${API_URL}/upload`, { method: "POST", body: formData });
+      const data = await res.json();
+      if (!res.ok || data.error || !data.project_id) {
+        throw new Error(data.error || "Upload failed");
+      }
 
-    // Derive thumbnail from Cloudinary video URL (snapshot at 0s)
-    const thumbnailUrl = data.video_url
-      ? data.video_url
-        .replace("/video/upload/", "/video/upload/so_0,w_640/")
-        .replace(/\.(mp4|mov|webm|avi)$/i, ".jpg")
-      : null;
+      // Register project in Supabase (best-effort — don't block navigation on failure)
+      await registerProject(data.project_id, file.name);
 
-    // Register project in Supabase (best-effort — don't block navigation on failure)
-    fetch("/api/projects", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        project_id: data.project_id,
-        name: file.name,
-        thumbnail_url: thumbnailUrl,
-      }),
-    }).catch(() => { });
+      // Redirect immediately — editor will kick off extract and poll for readiness
+      router.push(`/editor/${data.project_id}`);
+    } catch (error) {
+      setUploading(false);
+      setStatus(error instanceof Error ? error.message : "Upload failed");
+    }
+  }
 
-    // Redirect immediately — editor will kick off extract and poll for readiness
-    router.push(`/editor/${data.project_id}`);
+  async function loadDemoVideo() {
+    setUploading(true);
+    setStatus("Preparing the FrameShift demo...");
+    try {
+      const response = await fetch(`${API_URL}/demo`, { method: "POST" });
+      const data = await response.json();
+      if (!response.ok || data.error || !data.project_id) {
+        throw new Error(data.detail || data.error || "Demo video is unavailable");
+      }
+      await registerProject(data.project_id, data.video_name || "FrameShift-demo.mp4");
+      router.push(`/editor/${data.project_id}`);
+    } catch (error) {
+      setUploading(false);
+      setStatus(error instanceof Error ? error.message : "Could not load demo video");
+    }
   }
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -112,6 +134,13 @@ export function DropZone() {
               Get Started
             </button>
           </div>
+          <button
+            onClick={loadDemoVideo}
+            className="inline-flex items-center gap-2 mt-5 text-sm font-semibold text-[var(--accent)] transition-opacity hover:opacity-70"
+          >
+            <Play className="w-3.5 h-3.5" fill="currentColor" />
+            Try the built-in demo video
+          </button>
         </>
       )}
       <input

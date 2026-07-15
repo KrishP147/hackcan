@@ -16,9 +16,11 @@ export function EditProgressOverlay({ show, progress, status }: EditProgressOver
     : 0;
 
   const statusText = status === "uploading" 
-    ? "Uploading frames to Cloudinary..." 
+    ? "Preparing frames..."
     : status === "editing"
-    ? "Applying edits..."
+    ? progress.done === 0 && progress.total > 0
+      ? "Tracking selected object..."
+      : "Applying edits..."
     : "Processing...";
 
   return (

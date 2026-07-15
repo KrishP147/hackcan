@@ -69,7 +69,7 @@ export function EditorCanvas({
 
   const handleCanvasClick = useCallback(
     (e: React.MouseEvent) => {
-      if (!imgRef.current || !frameWidth || !frameHeight) {
+      if (isProcessing || isSegmenting || !imgRef.current || !frameWidth || !frameHeight) {
         return;
       }
       e.stopPropagation();
@@ -82,7 +82,7 @@ export function EditorCanvas({
       const clickY = Math.round(relY * frameHeight);
       onSegmentAtPoint(clickX, clickY);
     },
-    [frameWidth, frameHeight, onSegmentAtPoint]
+    [frameWidth, frameHeight, isProcessing, isSegmenting, onSegmentAtPoint]
   );
 
   // Draw border outline on canvas when mask exists
@@ -195,6 +195,18 @@ export function EditorCanvas({
           }}
           onClick={handleCanvasClick}
         >
+          {!isSegmenting && maskCount === 0 && aiEditStatus !== "preview" && (
+            <div className="absolute top-4 left-1/2 -translate-x-1/2 z-10 pointer-events-none rounded-xl border px-4 py-2 text-center backdrop-blur-md"
+              style={{
+                background: "rgba(10, 10, 10, 0.72)",
+                borderColor: "rgba(255,255,255,0.14)",
+              }}
+            >
+              <p className="text-xs font-semibold text-white">Click an object to start</p>
+              <p className="mt-0.5 text-[10px] text-white/60">SAM 2 will isolate your selection</p>
+            </div>
+          )}
+
           {frameUrl ? (
             <>
               <img

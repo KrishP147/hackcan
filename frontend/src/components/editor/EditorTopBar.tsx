@@ -12,7 +12,7 @@ interface EditorTopBarProps {
   onToggleTheme: () => void;
   editApplied?: boolean;
   onUndo?: () => void;
-  /** When provided, Save compiles and exports video as MP4 (render + download). */
+  /** When provided, Export compiles the current edited frames to an MP4. */
   onSave?: () => void | Promise<void>;
   isExporting?: boolean;
 }
@@ -100,7 +100,7 @@ export function EditorTopBar({
         )}
       </div>
 
-      {/* Right: Save + Undo + Theme toggle */}
+      {/* Right: Export + Undo + Theme toggle */}
       <div className="flex items-center gap-2">
         {videoLoaded && editApplied && onUndo && (
           <button
@@ -129,7 +129,7 @@ export function EditorTopBar({
             }}
           >
             {saved ? <Check className="w-3.5 h-3.5" /> : <Save className="w-3.5 h-3.5" />}
-            {isExporting ? "Exporting…" : saved ? "Saved" : "Save"}
+            {isExporting ? "Exporting…" : saved ? "Exported" : "Export"}
           </button>
         )}
 

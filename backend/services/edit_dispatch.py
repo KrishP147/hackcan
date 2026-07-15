@@ -18,6 +18,10 @@ from services import (background_tool, config, flow_service, local_edit_service,
 DETERMINISTIC = {"recolor", "blur_region", "color_pop", "glow"}
 
 
+class EditCancelled(RuntimeError):
+    """Raised between frames when the user cancels an edit job."""
+
+
 def _project_dir(project_id: str) -> Path:
     return project_manager.get_project_dir(project_id)
 
@@ -28,7 +32,8 @@ def _ensure_flows(project_dir: Path):
                                device=config.get_device())
 
 
-def _ensure_masks(project_id: str, project_dir: Path, start: int, end: int):
+def _ensure_masks(project_id: str, project_dir: Path, start: int, end: int,
+                  cancel_check=None):
     """SAM 2-propagate masks over any frames in range that lack one, then stabilize."""
     masks_dir = project_dir / "masks"
     missing = [t for t in range(start, end + 1)
@@ -46,22 +51,31 @@ def _ensure_masks(project_id: str, project_dir: Path, start: int, end: int):
     sam2_service.propagate_masks(
         project_dir / "frames", anchor, anchor_mask, masks_dir,
         click_x=status.get("click_x"), click_y=status.get("click_y"),
-        frame_step=1)
+        frame_step=config.get_mask_frame_step(), cancel_check=cancel_check)
     mask_service.stabilize_masks(masks_dir)
+    project_manager.update_status(
+        project_id,
+        mask_count=len(list(masks_dir.glob("mask_*.png"))),
+    )
 
 
-async def run_edit_rule(project_id: str, rule, progress_cb=None) -> None:
+async def run_edit_rule(project_id: str, rule, progress_cb=None, cancel_check=None) -> None:
     project_dir = _project_dir(project_id)
     device = config.get_device()
+    loop = asyncio.get_running_loop()
     indices = list(range(rule.start_frame, rule.end_frame + 1))
     status = project_manager.get_status(project_id)
     anchor = status.get("anchor_frame") or rule.start_frame
     anchor = min(max(anchor, rule.start_frame), rule.end_frame)
 
     if rule.edit_type in DETERMINISTIC:
-        _ensure_masks(project_id, project_dir, rule.start_frame, rule.end_frame)
-        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None, _ensure_masks, project_id, project_dir,
+            rule.start_frame, rule.end_frame, cancel_check,
+        )
         for n, t in enumerate(indices, 1):
+            if cancel_check and cancel_check():
+                raise EditCancelled()
             fp = project_dir / "frames" / f"frame_{t:04d}.jpg"
             mp = project_dir / "masks" / f"mask_{t:04d}.png"
             if not fp.exists():
@@ -81,16 +95,24 @@ async def run_edit_rule(project_id: str, rule, progress_cb=None) -> None:
                 progress_cb(n, len(indices))
         return
 
-    _ensure_flows(project_dir)                      # transport + generative need flow
-    _ensure_masks(project_id, project_dir, rule.start_frame, rule.end_frame)
+    await loop.run_in_executor(None, _ensure_flows, project_dir)
+    await loop.run_in_executor(
+        None, _ensure_masks, project_id, project_dir,
+        rule.start_frame, rule.end_frame, cancel_check,
+    )
 
     if rule.edit_type == "delete":
-        object_tools.apply_delete_range(project_dir, indices, device)
+        await loop.run_in_executor(
+            None, object_tools.apply_delete_range, project_dir, indices, device)
     elif rule.edit_type == "resize":
-        object_tools.apply_resize_range(project_dir, indices, rule.scale or 1.5, device)
+        await loop.run_in_executor(
+            None, object_tools.apply_resize_range,
+            project_dir, indices, rule.scale or 1.5, device)
     elif rule.edit_type == "move":
         offsets = {t: (rule.dx or 0, rule.dy or 0) for t in indices}
-        object_tools.apply_move_range(project_dir, indices, offsets, device)
+        await loop.run_in_executor(
+            None, object_tools.apply_move_range,
+            project_dir, indices, offsets, device)
     elif rule.edit_type == "bg_replace":
         await background_tool.apply_background_replace_range(
             project_dir, indices, anchor, rule.prompt or "", device)

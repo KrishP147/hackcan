@@ -5,6 +5,7 @@ import type { Project } from "@/lib/supabase";
 import { redirect } from "next/navigation";
 
 export default async function DashboardPage() {
+  if (!supabaseAdmin) redirect("/");
   const session = await auth0.getSession();
   if (!session) redirect("/api/auth/login?returnTo=/dashboard");
 

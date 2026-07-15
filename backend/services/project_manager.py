@@ -46,7 +46,8 @@ def reset_stuck_projects():
         return
     stuck_fields = {
         "ai_edit_status": (["processing"], "idle"),
-        "edit_status": (["uploading", "editing"], "idle"),
+        "edit_status": (["uploading", "editing", "processing"], "idle"),
+        "segment_status": (["segmenting", "propagating"], "error"),
         "refine_status": (["processing"], "idle"),
     }
     reset_values = {
@@ -54,6 +55,8 @@ def reset_stuck_projects():
         "ai_edit_progress": {"done": 0, "total": 0},
         "ai_interpolation_progress": {"done": 0, "total": 0},
         "edit_progress": {"done": 0, "total": 0},
+        "edit_phase": None,
+        "segment_error": "Operation interrupted by server restart.",
         "detecting": False,
         "segmenting": False,
     }
