@@ -943,6 +943,17 @@ async def edit_preview(req: PreviewRequest):
                 raise FileNotFoundError(f"Frame {req.frame_index} not found")
             if not mask_path.exists():
                 raise RuntimeError("No mask — click an object first")
+            from services import gemini_service
+            validation = await gemini_service.validate_edit_prompt(
+                frame_path,
+                mask_path,
+                req.edit_type,
+                req.prompt or "",
+            )
+            if not validation.valid:
+                raise ValueError(
+                    f"Try again with a better prompt. {validation.reason}"
+                )
             if req.edit_type == "replace":
                 from services import replace_tool
                 generated = await replace_tool._default_generate(

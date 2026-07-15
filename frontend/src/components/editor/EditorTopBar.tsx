@@ -129,7 +129,7 @@ export function EditorTopBar({
             }}
           >
             {saved ? <Check className="w-3.5 h-3.5" /> : <Save className="w-3.5 h-3.5" />}
-            {isExporting ? "Exporting…" : saved ? "Exported" : "Export"}
+            {isExporting ? "Exporting MP4…" : saved ? "MP4 Exported" : "Export MP4"}
           </button>
         )}
 

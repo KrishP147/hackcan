@@ -82,9 +82,11 @@ interface EditorState {
   isEditPreviewing: boolean;
 }
 
-// Edits with a sub-second single-frame preview; replace/bg_replace are generative
+// Every edit previews one keyframe before propagation. Replace and bg_replace
+// are slower because they generate that keyframe once with Gemini.
 const PREVIEWABLE_ACTIONS = new Set([
   "recolor", "blur_region", "color_pop", "glow", "resize", "delete", "move",
+  "replace", "bg_replace",
 ]);
 
 const DEFAULT_EDIT_PARAMS: EditParams = {
@@ -862,7 +864,7 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
       const current = state;
       if (!current.projectId || current.isProcessing || current.isSegmenting || current.isEditPreviewing) return;
 
-      const MASK_ACTIONS = new Set(["delete", "replace", "resize", "blur_region", "recolor", "move", "color_pop", "glow"]);
+      const MASK_ACTIONS = new Set(["delete", "replace", "resize", "blur_region", "recolor", "move", "color_pop", "glow", "bg_replace"]);
       const isMaskEdit = MASK_ACTIONS.has(action);
       const startFrame = current.editRangeStart > 0
         ? current.editRangeStart + 1
@@ -885,6 +887,7 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
       if (!PREVIEWABLE_ACTIONS.has(action)) return;
       const previewFrame0 = current.currentFrame;
       const pendingEdit: PendingEdit = { action, params: { ...params }, editRule };
+      const isGenerativePreview = action === "replace" || action === "bg_replace";
 
       setState((s) => {
         if (s.instantPreviewUrl) URL.revokeObjectURL(s.instantPreviewUrl);
@@ -897,6 +900,10 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
           instantPreviewFrame: previewFrame0,
           selectedObjectId: null,
           showEditPanel: false,
+          showToast: isGenerativePreview ? true : s.showToast,
+          toastMessage: isGenerativePreview
+            ? "Prompt received — Gemini is generating a keyframe preview."
+            : s.toastMessage,
         };
       });
 

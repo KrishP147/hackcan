@@ -1,7 +1,7 @@
 import { supabaseAdmin } from "@/lib/supabase";
 
 export const PROJECT_MEDIA_BUCKET = "project-media";
-export const MAX_PROJECT_BYTES = 100 * 1024 * 1024;
+export const MAX_PROJECT_BYTES = 50 * 1024 * 1024;
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 

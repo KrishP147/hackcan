@@ -3,14 +3,11 @@
 import { useCallback, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { AlertCircle, Clock3, Upload, Loader2 } from "lucide-react";
-import { getAccessToken } from "@auth0/nextjs-auth0/client";
 import { useVideoStore } from "@/stores/videoStore";
+import { uploadProjectVideo } from "@/lib/upload-project";
 import {
   MAX_VIDEO_DURATION_SECONDS,
-  validateVideoUpload,
 } from "@/lib/video-upload";
-
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 export function DropZone() {
   const router = useRouter();
@@ -21,48 +18,12 @@ export function DropZone() {
   const [status, setStatus] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  function registerProject(projectId: string, name: string) {
-    return fetch("/api/projects", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        project_id: projectId,
-        name,
-        thumbnail_url: null,
-      }),
-    }).catch(() => { });
-  }
-
   async function uploadFile(file: File) {
     setUploading(true);
     setStatus("Checking video length...");
 
     try {
-      await validateVideoUpload(file);
-      setStatus("Uploading video...");
-
-      const formData = new FormData();
-      formData.append("file", file);
-
-      // Auth is optional. Signed-in users attach an Auth0 API token so the
-      // backend records ownership; guests continue with no Authorization header.
-      const headers: HeadersInit = {};
-      try {
-        const token = await getAccessToken();
-        if (token) headers.Authorization = `Bearer ${token}`;
-      } catch {
-        // No session or Auth0 is not configured: continue as a guest.
-      }
-
-      const res = await fetch(`${API_URL}/upload`, {
-        method: "POST",
-        headers,
-        body: formData,
-      });
-      const data = await res.json();
-      if (!res.ok || data.error || !data.project_id) {
-        throw new Error(data.detail || data.error || "Upload failed");
-      }
+      const data = await uploadProjectVideo(file, setStatus);
 
       // Keep guest history in this browser. Signed-in users additionally get a
       // durable Supabase row that appears on every device in /dashboard.
@@ -70,14 +31,12 @@ export function DropZone() {
         projectId: data.project_id,
         videoName: file.name,
         uploadedAt: Date.now(),
-        status: "created",
+        status: data.compute_available ? "processing" : "stored",
+        storagePath: data.storage_path,
       });
       setCurrentProject(data.project_id);
 
-      // Register project in Supabase (best-effort — don't block navigation).
-      await registerProject(data.project_id, file.name);
-
-      // Redirect immediately — editor will kick off extract and poll for readiness
+      // The editor shows the durable video while Modal warms its working cache.
       router.push(`/editor/${data.project_id}`);
     } catch (error) {
       setUploading(false);

@@ -77,6 +77,22 @@ def patch_project(project_id: str, **updates) -> None:
         json=updates,
         timeout=30.0,
     )
+    if response.is_success:
+        return
+    # The media migration is backwards-compatible. Until its extra columns
+    # exist, at least keep the legacy status current; object paths remain
+    # deterministic and recoverable from the project id.
+    legacy_updates = {key: value for key, value in updates.items() if key == "status"}
+    if response.status_code == 400 and legacy_updates:
+        fallback = httpx.patch(
+            endpoint,
+            params={"project_id": f"eq.{project_id}"},
+            headers={**_headers(), "Content-Type": "application/json", "Prefer": "return=minimal"},
+            json=legacy_updates,
+            timeout=30.0,
+        )
+        fallback.raise_for_status()
+        return
     response.raise_for_status()
 
 
@@ -186,3 +202,45 @@ def sync_export(project_id: str, output_path: Path) -> str | None:
             project_id, storage_sync_status="error", storage_sync_error=str(exc))
         print(f"[storage] export sync failed for {project_id}: {exc}")
         return None
+
+
+def backfill_volume() -> dict[str, object]:
+    """Copy every existing Modal Volume project into durable storage."""
+    base_dir = project_manager.BASE_DIR
+    migrated: list[str] = []
+    failed: dict[str, str] = {}
+    if not configured() or not base_dir.exists():
+        return {"migrated": migrated, "failed": failed, "configured": configured()}
+
+    for project_dir in sorted(base_dir.iterdir()):
+        if not project_dir.is_dir() or not re_full_project_id(project_dir.name):
+            continue
+        project_id = project_dir.name
+        try:
+            original = project_dir / "original.mp4"
+            if original.exists():
+                remote_original = object_path(project_id, "original.mp4")
+                upload_file(original, remote_original, "video/mp4")
+                current_status = project_manager.get_status(project_id)
+                patch_project(
+                    project_id,
+                    original_path=remote_original,
+                    storage_status="stored",
+                    status=current_status.get("status") or "created",
+                )
+
+            if any((project_dir / "frames").glob("frame_*.jpg")):
+                sync_extract_metadata(project_id)
+                status = project_manager.get_status(project_id)
+                if int(status.get("edit_version") or 0) > 0:
+                    sync_current_video(project_id)
+            migrated.append(project_id)
+        except Exception as exc:
+            failed[project_id] = str(exc)
+            print(f"[storage] backfill failed for {project_id}: {exc}")
+
+    return {"migrated": migrated, "failed": failed, "configured": True}
+
+
+def re_full_project_id(value: str) -> bool:
+    return len(value) == 32 and all(char in "0123456789abcdef" for char in value)

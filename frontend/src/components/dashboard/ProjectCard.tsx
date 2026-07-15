@@ -10,6 +10,7 @@ const STATUS_STYLES: Record<string, { label: string; bg: string; text: string }>
   detecting:  { label: "Detecting",  bg: "#FEF3C7", text: "#D97706" },
   ready:      { label: "Ready",      bg: "#D1FAE5", text: "#059669" },
   processing: { label: "Processing", bg: "#DBEAFE", text: "#2563EB" },
+  stored:     { label: "Saved",      bg: "#EDE9FE", text: "#7C3AED" },
   done:       { label: "Done",       bg: "#D1FAE5", text: "#059669" },
   error:      { label: "Error",      bg: "#FEE2E2", text: "#DC2626" },
 };
@@ -24,8 +25,13 @@ export function ProjectCard({ project, onDelete }: { project: Project; onDelete:
   const router = useRouter();
   const [deleting, setDeleting] = useState(false);
   const [thumbnailUrl, setThumbnailUrl] = useState(project.thumbnail_url ?? "");
+  const [durableVideoUnavailable, setDurableVideoUnavailable] = useState(false);
   const [settingThumbnail, setSettingThumbnail] = useState(false);
   const status = STATUS_STYLES[project.status] ?? STATUS_STYLES.created;
+  const durableThumbnailUrl = project.thumbnail_path
+    ? `/api/projects/${project.project_id}/media?kind=thumbnail`
+    : thumbnailUrl;
+  const durableVideoUrl = `/api/projects/${project.project_id}/media?kind=current`;
 
   async function handleDelete(e: React.MouseEvent) {
     e.stopPropagation();
@@ -65,11 +71,23 @@ export function ProjectCard({ project, onDelete }: { project: Project; onDelete:
         className="aspect-video bg-[#111827] flex items-center justify-center relative"
         onClick={() => router.push(`/editor/${project.project_id}?frame=${project.last_frame}`)}
       >
-        {thumbnailUrl ? (
+        {durableThumbnailUrl ? (
           <img
-            src={thumbnailUrl}
+            src={durableThumbnailUrl}
             alt={project.name}
             className="w-full h-full object-cover"
+          />
+        ) : !durableVideoUnavailable ? (
+          <video
+            src={durableVideoUrl}
+            muted
+            playsInline
+            preload="metadata"
+            className="h-full w-full object-cover"
+            onLoadedMetadata={(event) => {
+              event.currentTarget.currentTime = Math.min(0.1, event.currentTarget.duration || 0);
+            }}
+            onError={() => setDurableVideoUnavailable(true)}
           />
         ) : (
           <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#374151" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">

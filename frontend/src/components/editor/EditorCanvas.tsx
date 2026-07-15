@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { Detection, EditMode, EditParams } from "@/lib/mock-data";
 import { BoundingBox } from "./BoundingBox";
 import type { EditAction } from "./EditToolbar";
@@ -26,6 +26,8 @@ interface EditorCanvasProps {
   zoom: number;
   currentFrame: number;
   totalFrames: number;
+  fps: number;
+  isPlaying: boolean;
   frameWidth: number;
   frameHeight: number;
   previewFrameUrl: string | null;
@@ -35,6 +37,10 @@ interface EditorCanvasProps {
   isEditPreviewing?: boolean;
   aiEditStatus: "idle" | "preview" | "applying" | "done";
   storageBaseUrl: string | null;
+  storedVideoUrl?: string | null;
+  onFrameReadyChange?: (ready: boolean) => void;
+  onPlaybackFrame?: (frame: number) => void;
+  onPlaybackEnded?: () => void;
   onSelectObject: (id: string | null) => void;
   onUpload: () => void;
   onApplyEdit: (action: EditAction, params: { color?: string; prompt?: string; scale?: number }) => void;
@@ -76,6 +82,8 @@ export function EditorCanvas({
   zoom,
   currentFrame,
   totalFrames,
+  fps,
+  isPlaying,
   frameWidth,
   frameHeight,
   previewFrameUrl,
@@ -85,6 +93,10 @@ export function EditorCanvas({
   isEditPreviewing,
   aiEditStatus,
   storageBaseUrl,
+  storedVideoUrl,
+  onFrameReadyChange,
+  onPlaybackFrame,
+  onPlaybackEnded,
   onSelectObject,
   onUpload,
   onApplyEdit,
@@ -95,13 +107,16 @@ export function EditorCanvas({
   onCancelEdit,
 }: EditorCanvasProps) {
   const imgRef = useRef<HTMLDivElement>(null);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [frameReady, setFrameReady] = useState(false);
+  const [frameRetry, setFrameRetry] = useState(0);
   const hasMaskForCurrentFrame = maskCount > 0 && (
     segmentStatus === "done" || segmentAnchorFrame === currentFrame + 1
   );
 
   const handleCanvasClick = useCallback(
     (e: React.MouseEvent) => {
-      if (isProcessing || isSegmenting || !imgRef.current || !frameWidth || !frameHeight) {
+      if (!frameReady || isProcessing || isSegmenting || !imgRef.current || !frameWidth || !frameHeight) {
         return;
       }
       e.stopPropagation();
@@ -114,12 +129,8 @@ export function EditorCanvas({
       const clickY = Math.round(relY * frameHeight);
       onSegmentAtPoint(clickX, clickY);
     },
-    [frameWidth, frameHeight, isProcessing, isSegmenting, onSegmentAtPoint]
+    [frameHeight, frameReady, frameWidth, isProcessing, isSegmenting, onSegmentAtPoint]
   );
-
-  if (!videoLoaded) {
-    return <EmptyCanvas onUpload={onUpload} />;
-  }
 
   // Show preview frame if in preview mode, otherwise show current frame
   // Use per-frame versioning for transformed frames, otherwise use global editVersion
@@ -137,6 +148,54 @@ export function EditorCanvas({
       ? `${storageBaseUrl}/frame_${paddedIndex}.jpg`
       : `${API_URL}/frame/${projectId}/${currentFrameIndex}?v=${frameVersion}`
     : null;
+  const retryableFrameUrl = frameUrl
+    ? frameUrl.startsWith("blob:") || frameUrl.startsWith("data:")
+      ? frameUrl
+      : `${frameUrl}${frameUrl.includes("?") ? "&" : "?"}retry=${frameRetry}`
+    : null;
+
+  useEffect(() => {
+    setFrameReady(false);
+    onFrameReadyChange?.(false);
+    return () => {
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+    };
+  }, [currentFrame, frameUrl, frameVersion, onFrameReadyChange]);
+
+  const handleFrameLoaded = () => {
+    if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+    setFrameReady(true);
+    onFrameReadyChange?.(true);
+  };
+
+  const handleFrameError = () => {
+    setFrameReady(false);
+    onFrameReadyChange?.(false);
+    if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+    retryTimerRef.current = setTimeout(() => {
+      setFrameRetry((retry) => retry + 1);
+    }, 2000);
+  };
+
+  if (!videoLoaded) {
+    if (storedVideoUrl) {
+      return <StoredVideoCanvas videoUrl={storedVideoUrl} />;
+    }
+    return <EmptyCanvas onUpload={onUpload} />;
+  }
+
+  if (isPlaying && storedVideoUrl) {
+    return (
+      <SynchronizedPlaybackCanvas
+        videoUrl={storedVideoUrl}
+        currentFrame={currentFrame}
+        totalFrames={totalFrames}
+        fps={fps}
+        onFrameChange={onPlaybackFrame}
+        onEnded={onPlaybackEnded}
+      />
+    );
+  }
 
   return (
     <div
@@ -153,14 +212,14 @@ export function EditorCanvas({
       >
         <div
           ref={imgRef}
-          className="w-[768px] h-[432px] rounded-2xl overflow-hidden relative shadow-2xl cursor-crosshair"
+          className="w-[min(768px,calc(100vw-340px))] aspect-video rounded-2xl overflow-hidden relative shadow-2xl cursor-crosshair"
           style={{
             background: "var(--ed-surface-2)",
             boxShadow: "0 25px 60px rgba(0,0,0,0.25)",
           }}
           onClick={handleCanvasClick}
         >
-          {!isSegmenting && !hasMaskForCurrentFrame && aiEditStatus !== "preview" && (
+          {frameReady && !isSegmenting && !hasMaskForCurrentFrame && aiEditStatus !== "preview" && (
             <div className="absolute top-4 left-1/2 -translate-x-1/2 z-10 pointer-events-none rounded-xl border px-4 py-2 text-center backdrop-blur-md"
               style={{
                 background: "rgba(10, 10, 10, 0.72)",
@@ -172,12 +231,25 @@ export function EditorCanvas({
             </div>
           )}
 
-          {frameUrl ? (
+          {!frameReady && storedVideoUrl && (
+            <video
+              src={storedVideoUrl}
+              controls
+              playsInline
+              preload="metadata"
+              className="absolute inset-0 z-0 h-full w-full bg-black object-contain"
+              onClick={(event) => event.stopPropagation()}
+            />
+          )}
+
+          {retryableFrameUrl ? (
             <>
               <img
-                src={frameUrl}
+                src={retryableFrameUrl}
                 alt={aiEditStatus === "preview" ? "AI Preview" : `Frame ${currentFrame + 1}`}
-                className="absolute inset-0 w-full h-full object-contain pointer-events-none"
+                className={`absolute inset-0 z-[1] h-full w-full object-contain transition-opacity ${frameReady ? "opacity-100" : "pointer-events-none opacity-0"}`}
+                onLoad={handleFrameLoaded}
+                onError={handleFrameError}
               />
               {aiEditStatus === "preview" && (
                 <div className="absolute top-4 left-4 z-30 px-3 py-1.5 rounded-xl text-xs font-medium border"
@@ -199,9 +271,15 @@ export function EditorCanvas({
             </div>
           )}
 
+          {!frameReady && (
+            <div className="pointer-events-none absolute left-1/2 top-4 z-20 -translate-x-1/2 rounded-full border border-white/10 bg-black/70 px-4 py-2 text-[10px] font-medium text-white/70 backdrop-blur">
+              Restoring editor frames…
+            </div>
+          )}
+
 
           {/* Hide masks and detections when showing AI preview */}
-          {aiEditStatus !== "preview" && projectId && hasMaskForCurrentFrame && !isSegmenting && (
+          {frameReady && aiEditStatus !== "preview" && projectId && hasMaskForCurrentFrame && !isSegmenting && (
             <>
               <img
                 src={`${API_URL}/mask-outline/${projectId}/${currentFrameIndex}?v=${maskVersion}`}
@@ -235,7 +313,9 @@ export function EditorCanvas({
               >
                 <div className="w-6 h-6 border-2 border-[var(--accent)] border-t-transparent rounded-full animate-spin" />
                 <span className="text-white/75 text-xs font-medium">
-                  Preparing {pendingEditAction ? EDIT_LABELS[pendingEditAction] || pendingEditAction : "edit"} preview…
+                  {pendingEditAction === "replace" || pendingEditAction === "bg_replace"
+                    ? `Gemini is generating the ${EDIT_LABELS[pendingEditAction]} keyframe…`
+                    : `Preparing ${pendingEditAction ? EDIT_LABELS[pendingEditAction] || pendingEditAction : "edit"} preview…`}
                 </span>
                 <span className="text-white/40 text-[10px]">Current frame only</span>
               </div>
@@ -318,6 +398,127 @@ export function EditorCanvas({
               onClick={() => onSelectObject(det.id)}
             />
           ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StoredVideoCanvas({ videoUrl }: { videoUrl: string }) {
+  return (
+    <div
+      className="flex flex-1 items-center justify-center p-8"
+      style={{ background: "var(--ed-bg)" }}
+    >
+      <div className="w-full max-w-[900px]">
+        <div className="overflow-hidden rounded-2xl bg-black shadow-2xl">
+          <video
+            src={videoUrl}
+            controls
+            playsInline
+            preload="metadata"
+            className="aspect-video w-full object-contain"
+          />
+        </div>
+        <div
+          className="mx-auto mt-4 flex w-fit items-center gap-2 rounded-full border px-4 py-2 text-xs"
+          style={{
+            background: "var(--ed-surface)",
+            borderColor: "var(--ed-border)",
+            color: "var(--ed-muted)",
+          }}
+        >
+          <span className="h-2 w-2 rounded-full bg-emerald-500" />
+          Video saved in Supabase · GPU editor is preparing
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SynchronizedPlaybackCanvas({
+  videoUrl,
+  currentFrame,
+  totalFrames,
+  fps,
+  onFrameChange,
+  onEnded,
+}: {
+  videoUrl: string;
+  currentFrame: number;
+  totalFrames: number;
+  fps: number;
+  onFrameChange?: (frame: number) => void;
+  onEnded?: () => void;
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const lastReportedFrameRef = useRef(currentFrame);
+  const safeFps = Math.max(fps, 1);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    const startPlayback = () => {
+      video.currentTime = Math.max(0, currentFrame / safeFps);
+      void video.play().catch(() => {
+        // Muted inline playback is normally allowed. If the browser still
+        // blocks it, the next explicit timeline click will retry playback.
+      });
+    };
+
+    if (video.readyState >= HTMLMediaElement.HAVE_METADATA) {
+      startPlayback();
+    } else {
+      video.addEventListener("loadedmetadata", startPlayback, { once: true });
+    }
+
+    return () => video.removeEventListener("loadedmetadata", startPlayback);
+    // Mounting this canvas is the play action. Frame changes are synchronized
+    // separately so they do not restart the video every frame.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videoUrl]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || video.readyState < HTMLMediaElement.HAVE_METADATA) return;
+    const targetTime = currentFrame / safeFps;
+    if (Math.abs(video.currentTime - targetTime) > 0.5) {
+      video.currentTime = targetTime;
+    }
+  }, [currentFrame, safeFps]);
+
+  const reportCurrentFrame = () => {
+    const video = videoRef.current;
+    if (!video || totalFrames <= 0) return;
+    const frame = Math.min(
+      totalFrames - 1,
+      Math.max(0, Math.floor(video.currentTime * safeFps)),
+    );
+    if (frame === lastReportedFrameRef.current) return;
+    lastReportedFrameRef.current = frame;
+    onFrameChange?.(frame);
+  };
+
+  return (
+    <div
+      className="flex flex-1 items-center justify-center overflow-hidden relative"
+      style={{ background: "var(--ed-bg)" }}
+    >
+      <div className="relative w-[min(768px,calc(100vw-340px))] aspect-video overflow-hidden rounded-2xl bg-black shadow-2xl">
+        <video
+          ref={videoRef}
+          src={videoUrl}
+          autoPlay
+          muted
+          playsInline
+          preload="auto"
+          className="h-full w-full object-contain"
+          onTimeUpdate={reportCurrentFrame}
+          onEnded={onEnded}
+        />
+        <div className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 rounded-full border border-white/10 bg-black/70 px-4 py-2 text-[10px] font-medium text-white/75 backdrop-blur">
+          Playing video · Pause to edit this frame
         </div>
       </div>
     </div>

@@ -3,14 +3,11 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { AlertCircle, Clock3, Upload, Loader2 } from "lucide-react";
-import { getAccessToken } from "@auth0/nextjs-auth0/client";
 import { useVideoStore } from "@/stores/videoStore";
+import { uploadProjectVideo } from "@/lib/upload-project";
 import {
   MAX_VIDEO_DURATION_SECONDS,
-  validateVideoUpload,
 } from "@/lib/video-upload";
-
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 export function StickyCTA() {
   const [visible, setVisible] = useState(false);
@@ -37,44 +34,16 @@ export function StickyCTA() {
     setError("");
 
     try {
-      await validateVideoUpload(file);
-      const formData = new FormData();
-      formData.append("file", file);
-
-      const headers: HeadersInit = {};
-      try {
-        const token = await getAccessToken();
-        if (token) headers.Authorization = `Bearer ${token}`;
-      } catch {
-        // Guest uploads remain supported.
-      }
-
-      const res = await fetch(`${API_URL}/upload`, {
-        method: "POST",
-        headers,
-        body: formData,
-      });
-      const data = await res.json();
-      if (!res.ok || !data.project_id) {
-        throw new Error(data.detail || data.error || "Upload failed");
-      }
+      const data = await uploadProjectVideo(file);
 
       addProject({
         projectId: data.project_id,
         videoName: file.name,
         uploadedAt: Date.now(),
-        status: "created",
+        status: data.compute_available ? "processing" : "stored",
+        storagePath: data.storage_path,
       });
       setCurrentProject(data.project_id);
-
-      // Signed-in users get durable cross-device history. Guests simply get a
-      // 401 here and continue using local browser history.
-      await fetch("/api/projects", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project_id: data.project_id, name: file.name }),
-      }).catch(() => {});
-
       router.push(`/editor/${data.project_id}`);
     } catch (uploadError) {
       setUploading(false);

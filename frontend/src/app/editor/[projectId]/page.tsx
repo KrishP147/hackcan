@@ -9,11 +9,9 @@ import { EditProgressOverlay } from "@/components/editor/EditProgressOverlay";
 import { ExportProgressOverlay } from "@/components/editor/ExportProgressOverlay";
 import { useEditorState } from "@/hooks/useEditorState";
 import { useProjectSync } from "@/hooks/useProjectSync";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, useSearchParams } from "next/navigation";
 import { useVideoStore } from "@/stores/videoStore";
-
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 export default function EditorPage() {
   const params = useParams();
@@ -22,14 +20,32 @@ export default function EditorPage() {
   const initialFrame = Number(searchParams.get("frame") ?? 0);
   const setCurrentProject = useVideoStore((state) => state.setCurrentProject);
   const addProject = useVideoStore((state) => state.addProject);
+  const locallyStored = useVideoStore((state) =>
+    Boolean(state.projects.find((project) => project.projectId === projectId)?.storagePath)
+  );
   const editor = useEditorState(projectId, initialFrame);
+  const [hasStoredVideo, setHasStoredVideo] = useState(locallyStored);
+  const [editorFrameReady, setEditorFrameReady] = useState(false);
+
+  useEffect(() => {
+    if (locallyStored) setHasStoredVideo(true);
+  }, [locallyStored]);
+
+  useEffect(() => {
+    if (!projectId || hasStoredVideo) return;
+    void fetch(`/api/projects/${projectId}/media?kind=current`, { method: "HEAD" })
+      .then((response) => {
+        if (response.ok) setHasStoredVideo(true);
+      })
+      .catch(() => {});
+  }, [hasStoredVideo, projectId]);
 
   useProjectSync({
     projectId,
     currentFrame: editor.currentFrame,
     videoLoaded: editor.videoLoaded,
-    status: editor.videoLoaded ? "ready" : "created",
-    thumbnailUrl: editor.videoLoaded ? `${API_URL}/frame/${projectId}/1` : null,
+    status: editor.videoLoaded ? "ready" : "",
+    thumbnailUrl: null,
     name: editor.videoName,
   });
 
@@ -49,6 +65,9 @@ export default function EditorPage() {
         ? project.name
         : "Untitled Project";
       editor.setVideoName(projectName);
+      setHasStoredVideo(
+        Boolean(project.original_path) || ["stored", "processing"].includes(project.status)
+      );
       addProject({
         projectId,
         videoName: projectName,
@@ -66,6 +85,13 @@ export default function EditorPage() {
     };
   }, [addProject, editor.setCurrentFrame, editor.setVideoName, projectId, searchParams]);
 
+  // Recreate Modal's disposable cache from durable Supabase media. Failure is
+  // non-fatal: the stored video remains playable below.
+  useEffect(() => {
+    if (!projectId) return;
+    void fetch(`/api/projects/${projectId}/resume`, { method: "POST" }).catch(() => {});
+  }, [projectId]);
+
   // Set current project in Zustand when page loads
   useEffect(() => {
     if (projectId) {
@@ -77,7 +103,8 @@ export default function EditorPage() {
   const framesLengthRef = useRef(editor.frames.length);
   const [isDark, setIsDark] = useState(false);
 
-  // Playback loop — 15 fps so frames have time to load
+  // Frame-by-frame fallback for projects that do not yet have a durable MP4.
+  // Stored projects use the browser's native video decoder in EditorCanvas.
   const playbackFps = 15;
   useEffect(() => {
     currentFrameRef.current = editor.currentFrame;
@@ -88,7 +115,7 @@ export default function EditorPage() {
   }, [editor.frames.length]);
 
   useEffect(() => {
-    if (editor.isPlaying && editor.videoLoaded) {
+    if (editor.isPlaying && editor.videoLoaded && !hasStoredVideo) {
       playIntervalRef.current = setInterval(() => {
         const frameCount = framesLengthRef.current;
         if (frameCount <= 0) return;
@@ -102,7 +129,12 @@ export default function EditorPage() {
     return () => {
       if (playIntervalRef.current) clearInterval(playIntervalRef.current);
     };
-  }, [editor.isPlaying, editor.videoLoaded, editor.setCurrentFrame]);
+  }, [editor.isPlaying, editor.videoLoaded, editor.setCurrentFrame, hasStoredVideo]);
+
+  const handlePlaybackEnded = useCallback(() => {
+    editor.setCurrentFrame(0);
+    if (editor.isPlaying) editor.togglePlay();
+  }, [editor.isPlaying, editor.setCurrentFrame, editor.togglePlay]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -167,6 +199,8 @@ export default function EditorPage() {
           zoom={editor.zoom}
           currentFrame={editor.currentFrame}
           totalFrames={editor.frames.length}
+          fps={editor.fps}
+          isPlaying={editor.isPlaying}
           frameWidth={editor.frameWidth}
           frameHeight={editor.frameHeight}
           previewFrameUrl={editor.aiPreviewFrameUrl}
@@ -176,6 +210,12 @@ export default function EditorPage() {
           isEditPreviewing={editor.isEditPreviewing}
           aiEditStatus={editor.aiEditStatus}
           storageBaseUrl={editor.storageBaseUrl}
+          storedVideoUrl={hasStoredVideo
+            ? `/api/projects/${projectId}/media?kind=current`
+            : null}
+          onFrameReadyChange={setEditorFrameReady}
+          onPlaybackFrame={editor.setCurrentFrame}
+          onPlaybackEnded={handlePlaybackEnded}
           onSelectObject={editor.selectObject}
           onUpload={editor.loadVideo}
           onApplyEdit={editor.applyEditAction}
@@ -192,9 +232,11 @@ export default function EditorPage() {
               ? editor.detections.find((d) => d.id === editor.selectedObjectId)?.label || "object"
               : "selection"
           }
-          active={!editor.isSegmenting && !editor.isProcessing && !editor.isEditPreviewing && !editor.pendingEdit && editor.videoLoaded && editor.segmentStatus !== "keyframe_ready"}
+          active={editorFrameReady && !editor.isPlaying && !editor.isSegmenting && !editor.isProcessing && !editor.isEditPreviewing && !editor.pendingEdit && editor.videoLoaded && editor.segmentStatus !== "keyframe_ready"}
           hasMask={editor.maskCount > 0}
           editApplied={editor.editVersion > 0}
+          isPreviewing={editor.isEditPreviewing}
+          pendingAction={editor.pendingEdit?.action ?? null}
           onApply={editor.applyEditAction}
           onUndo={editor.undoEdit}
           onClose={editor.closeEditPanel}

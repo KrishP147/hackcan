@@ -59,12 +59,14 @@ interface EditToolbarProps {
   active: boolean;
   hasMask: boolean;
   editApplied: boolean;
+  isPreviewing: boolean;
+  pendingAction?: string | null;
   onApply: (action: EditAction, params: { color?: string; prompt?: string; scale?: number; dx?: number; dy?: number }) => void;
   onUndo: () => void;
   onClose: () => void;
 }
 
-export function EditToolbar({ objectLabel, active, hasMask, editApplied, onApply, onUndo, onClose }: EditToolbarProps) {
+export function EditToolbar({ objectLabel, active, hasMask, editApplied, isPreviewing, pendingAction, onApply, onUndo, onClose }: EditToolbarProps) {
   const [selected, setSelected] = useState<EditOption | null>(null);
   const [color, setColor] = useState("#F43F5E");
   const [prompt, setPrompt] = useState("");
@@ -75,10 +77,12 @@ export function EditToolbar({ objectLabel, active, hasMask, editApplied, onApply
 
   const objectEdits = EDIT_OPTIONS.filter((o) => o.category === "object");
   const frameEdits = EDIT_OPTIONS.filter((o) => o.category === "frame");
+  const selectedRequestPending = Boolean(selected && pendingAction === selected.id);
+  const selectedPreviewReady = selectedRequestPending && !isPreviewing;
 
   const handleApply = () => {
     if (!selected || !active) return;
-    if (selected.category === "object" && !hasMask) return;
+    if ((selected.category === "object" || selected.id === "bg_replace") && !hasMask) return;
     
     // Read prompt directly from input to avoid stale state
     const currentPrompt = selected.needsPrompt && promptInputRef.current
@@ -93,28 +97,25 @@ export function EditToolbar({ objectLabel, active, hasMask, editApplied, onApply
       dy: selected.needsOffset ? dy : undefined,
     });
     
-    // Reset selection after applying
-    setSelected(null);
-    setPrompt("");
   };
 
   return (
     <div
-      className="w-[220px] shrink-0 flex flex-col overflow-y-auto border-l"
+      className="w-[300px] xl:w-[340px] shrink-0 flex flex-col overflow-y-auto border-l"
       style={{ background: "var(--ed-surface)", borderColor: "var(--ed-border)" }}
       onClick={(e) => e.stopPropagation()}
     >
 
 
       {!selected ? (
-        <div className="p-3 flex-1">
+        <div className="p-5 xl:p-6 flex-1">
           <p
-            className="text-[10px] uppercase tracking-widest font-semibold mb-2 px-1"
+            className="text-xs uppercase tracking-widest font-semibold mb-4 px-1"
             style={{ color: (active && hasMask) ? "var(--ed-icon-dim)" : "var(--ed-disabled)" }}
           >
             Object {!hasMask && active && <span className="normal-case tracking-normal font-normal">(segment first)</span>}
           </p>
-          <div className="grid grid-cols-3 gap-1 mb-4">
+          <div className="grid grid-cols-3 gap-2 mb-7">
             {objectEdits.map((opt) => {
               const Icon = opt.icon;
               const enabled = active && hasMask;
@@ -131,7 +132,7 @@ export function EditToolbar({ objectLabel, active, hasMask, editApplied, onApply
                       setPrompt("");
                     }
                   }}
-                  className="flex flex-col items-center gap-1.5 py-2.5 px-1 rounded-xl transition-all"
+                  className="flex min-h-20 flex-col items-center justify-center gap-2 py-3 px-1 rounded-xl transition-all"
                   style={{
                     color: enabled ? "var(--ed-icon)" : "var(--ed-disabled)",
                     cursor: enabled ? "pointer" : "not-allowed",
@@ -139,26 +140,27 @@ export function EditToolbar({ objectLabel, active, hasMask, editApplied, onApply
                   onMouseEnter={(e) => enabled && (e.currentTarget.style.background = "var(--ed-hover)")}
                   onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
                 >
-                  <Icon className="w-4 h-4" strokeWidth={1.5} />
-                  <span className="text-[10px] font-medium">{opt.label}</span>
+                  <Icon className="w-5 h-5" strokeWidth={1.5} />
+                  <span className="text-xs font-medium">{opt.label}</span>
                 </button>
               );
             })}
           </div>
 
           <p
-            className="text-[10px] uppercase tracking-widest font-semibold mb-2 px-1"
+            className="text-xs uppercase tracking-widest font-semibold mb-4 px-1"
             style={{ color: active ? "var(--ed-icon-dim)" : "var(--ed-disabled)" }}
           >
-            Whole Frame
+            Whole Frame {!hasMask && active && <span className="normal-case tracking-normal font-normal">(segment foreground first)</span>}
           </p>
-          <div className="grid grid-cols-3 gap-1">
+          <div className="grid grid-cols-3 gap-2">
             {frameEdits.map((opt) => {
               const Icon = opt.icon;
+              const enabled = active && (opt.id !== "bg_replace" || hasMask);
               return (
                 <button
                   key={opt.id}
-                  disabled={!active}
+                  disabled={!enabled}
                   onClick={() => {
                     if (!opt.needsColor && !opt.needsPrompt && !opt.needsScale && !opt.needsOffset) {
                       onApply(opt.id, {});
@@ -168,31 +170,31 @@ export function EditToolbar({ objectLabel, active, hasMask, editApplied, onApply
                       setPrompt("");
                     }
                   }}
-                  className="flex flex-col items-center gap-1.5 py-2.5 px-1 rounded-xl transition-all"
+                  className="flex min-h-20 flex-col items-center justify-center gap-2 py-3 px-1 rounded-xl transition-all"
                   style={{
-                    color: active ? "var(--ed-icon)" : "var(--ed-disabled)",
-                    cursor: active ? "pointer" : "not-allowed",
+                    color: enabled ? "var(--ed-icon)" : "var(--ed-disabled)",
+                    cursor: enabled ? "pointer" : "not-allowed",
                   }}
-                  onMouseEnter={(e) => active && (e.currentTarget.style.background = "var(--ed-hover)")}
+                  onMouseEnter={(e) => enabled && (e.currentTarget.style.background = "var(--ed-hover)")}
                   onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
                 >
-                  <Icon className="w-4 h-4" strokeWidth={1.5} />
-                  <span className="text-[10px] font-medium">{opt.label}</span>
+                  <Icon className="w-5 h-5" strokeWidth={1.5} />
+                  <span className="text-xs font-medium">{opt.label}</span>
                 </button>
               );
             })}
           </div>
 
           <div
-            className="mt-4 flex gap-2 rounded-xl border px-2.5 py-2.5"
+            className="mt-7 flex gap-3 rounded-2xl border px-4 py-4"
             style={{
               background: "var(--ed-surface-2)",
               borderColor: "var(--ed-border)",
               color: "var(--ed-subtle)",
             }}
           >
-            <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
-            <p className="text-[10px] leading-4">
+            <Info className="mt-0.5 h-4 w-4 shrink-0 text-[var(--accent)]" />
+            <p className="text-xs leading-5">
               <span className="font-semibold" style={{ color: "var(--ed-muted)" }}>
                 {editApplied ? "Edit saved — keep going." : "You can stack edits."}
               </span>{" "}
@@ -202,7 +204,7 @@ export function EditToolbar({ objectLabel, active, hasMask, editApplied, onApply
 
         </div>
       ) : (
-        <div className="p-4 space-y-4 flex-1">
+        <div className="p-6 space-y-5 flex-1">
           <button
             onClick={() => setSelected(null)}
             className="text-xs transition-colors"
@@ -323,7 +325,7 @@ export function EditToolbar({ objectLabel, active, hasMask, editApplied, onApply
 
           <button
             onClick={handleApply}
-            disabled={selected.needsPrompt && !prompt.trim()}
+            disabled={!active || isPreviewing || selectedPreviewReady || (selected.needsPrompt && !prompt.trim())}
             className="w-full py-2.5 rounded-xl text-white text-sm font-semibold transition-all disabled:opacity-30 disabled:cursor-not-allowed"
             style={{
               background: "var(--accent)",
@@ -332,8 +334,34 @@ export function EditToolbar({ objectLabel, active, hasMask, editApplied, onApply
             onMouseEnter={(e) => (e.currentTarget.style.background = "var(--accent-hover)")}
             onMouseLeave={(e) => (e.currentTarget.style.background = "var(--accent)")}
           >
-            Preview {selected.label}
+            {isPreviewing && selectedRequestPending
+              ? "Gemini is generating…"
+              : selectedPreviewReady
+                ? "Preview ready"
+                : `Preview ${selected.label}`}
           </button>
+
+          {selectedRequestPending && (
+            <div
+              className="flex gap-3 rounded-2xl border px-4 py-3"
+              style={{
+                background: "var(--ed-surface-2)",
+                borderColor: "var(--ed-border)",
+                color: "var(--ed-subtle)",
+              }}
+            >
+              {isPreviewing ? (
+                <RefreshCw className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-[var(--accent)]" />
+              ) : (
+                <span className="mt-0.5 h-4 w-4 shrink-0 text-center text-emerald-500">✓</span>
+              )}
+              <p className="text-xs leading-5">
+                {isPreviewing
+                  ? "Prompt received. Gemini is creating one keyframe preview; this usually takes 5–20 seconds."
+                  : "Preview ready. Confirm “Apply to all frames” on the video, or cancel and revise your prompt."}
+              </p>
+            </div>
+          )}
         </div>
       )}
     </div>

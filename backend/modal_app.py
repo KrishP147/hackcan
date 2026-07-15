@@ -88,3 +88,18 @@ class Server:
         from main import app as fastapi
 
         return fastapi
+
+
+@app.function(
+    image=image,
+    volumes={"/root/projects": volume},
+    secrets=[modal.Secret.from_name("frameshift-secrets")],
+    timeout=20 * 60,
+)
+def backfill_storage():
+    """One-time migration from the Modal cache to Supabase Storage."""
+    from services.supabase_storage_service import backfill_volume
+
+    result = backfill_volume()
+    volume.commit()
+    return result

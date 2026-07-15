@@ -1,9 +1,13 @@
 import os
 import base64
+import asyncio
+import json
+from dataclasses import dataclass
 from pathlib import Path
 from google import genai
 from google.genai import types
 from google.genai.types import FinishReason
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import numpy as np
 from PIL import Image
@@ -14,6 +18,106 @@ env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
 _client = None
+
+
+@dataclass(frozen=True)
+class PromptValidationResult:
+    valid: bool
+    reason: str = ""
+
+
+class _PromptValidationPayload(BaseModel):
+    valid: bool = Field(description="Whether the prompt matches the active edit tool")
+    reason: str = Field(description="Brief user-facing reason for the decision")
+
+
+async def validate_edit_prompt(
+    frame_path: Path,
+    mask_path: Path,
+    edit_type: str,
+    prompt: str,
+) -> PromptValidationResult:
+    """Use Gemini to reject unrelated/vague generative edit prompts.
+
+    The frame and selection mask give the validator visual context. This runs
+    before the more expensive image-generation request, so rejected prompts do
+    not mutate a project or consume an image-generation call.
+    """
+    cleaned = " ".join(prompt.split())
+    if len(cleaned) < 3:
+        return PromptValidationResult(
+            False, "Describe what the selected object or background should become."
+        )
+    if len(cleaned) > 500:
+        return PromptValidationResult(
+            False, "Keep the edit description under 500 characters."
+        )
+    if edit_type not in {"replace", "bg_replace"}:
+        return PromptValidationResult(False, "This prompt does not match a generative tool.")
+
+    mode = "REPLACE_SELECTED_OBJECT" if edit_type == "replace" else "REPLACE_BACKGROUND"
+
+    def _validate_sync() -> PromptValidationResult:
+        client = _get_client()
+        parts = [
+            types.Part.from_bytes(data=frame_path.read_bytes(), mime_type="image/jpeg"),
+        ]
+        if mask_path.exists():
+            parts.append(
+                types.Part.from_bytes(data=mask_path.read_bytes(), mime_type="image/png")
+            )
+        parts.append(types.Part.from_text(text=f"""
+You validate a natural-language video-edit prompt before an image model runs.
+The first image is the current video frame. The second image is a binary mask:
+white marks the selected foreground object and black marks the background.
+
+Active mode: {mode}
+User prompt: {cleaned}
+
+For REPLACE_SELECTED_OBJECT, accept only a concrete visual description of what
+the selected object should become. Reject unrelated conversation, questions,
+nonsense, vague requests, background/scene requests, or requests that belong
+to another tool such as remove, recolor, glow, blur, resize, or move.
+
+For REPLACE_BACKGROUND, accept only a concrete visual description of the new
+background, environment, location, or scene. Reject unrelated conversation,
+questions, nonsense, vague requests, selected-object changes, or requests that
+belong to another tool.
+
+Imaginative prompts are valid when they clearly describe the correct target.
+Return JSON only in exactly this shape:
+{{"valid": true or false, "reason": "brief user-facing explanation"}}
+"""))
+        response = client.models.generate_content(
+            model=os.getenv("GEMINI_VALIDATION_MODEL", "gemini-3.5-flash"),
+            contents=[types.Content(parts=parts)],
+            config=types.GenerateContentConfig(
+                temperature=0,
+                response_mime_type="application/json",
+                response_schema=_PromptValidationPayload,
+            ),
+        )
+        raw = (getattr(response, "text", None) or "").strip()
+        if raw.startswith("```"):
+            raw = raw.removeprefix("```json").removeprefix("```")
+            raw = raw.removesuffix("```").strip()
+        try:
+            result = json.loads(raw)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Gemini prompt validation returned an invalid response") from exc
+        if not isinstance(result.get("valid"), bool):
+            raise RuntimeError("Gemini prompt validation omitted its decision")
+        reason = str(result.get("reason") or "The prompt does not match this tool.")[:240]
+        return PromptValidationResult(result["valid"], reason)
+
+    try:
+        return await asyncio.to_thread(_validate_sync)
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        # Keep provider/SDK exceptions inside the preview endpoint's handled
+        # error contract instead of leaking an opaque HTTP 500.
+        raise RuntimeError(f"Prompt validation is temporarily unavailable: {exc}") from exc
 
 
 def _get_client():
