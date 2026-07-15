@@ -16,6 +16,10 @@ _image_predictor = None
 _video_predictor = None
 
 
+class PropagationCancelled(RuntimeError):
+    """Raised when a user cancels an in-flight mask propagation job."""
+
+
 def reset_predictors():
     """Call after switching checkpoints to force reload."""
     global _image_predictor, _video_predictor
@@ -85,13 +89,14 @@ def propagate_masks(
     masks_dir: Path,
     click_x: int = None,
     click_y: int = None,
-    frame_step: int = 10,
+    frame_step: int = 1,
+    cancel_check=None,
 ) -> int:
     """
     Propagate segmentation masks across video frames using SAM 2 video predictor.
 
-    frame_step: process every Nth frame for speed. Frames in between get the
-                nearest propagated mask. Set to 1 for full quality.
+    frame_step: process every Nth frame. Production passes 1; larger values
+                are an explicit degraded local-preview mode only.
     """
     masks_dir.mkdir(parents=True, exist_ok=True)
 
@@ -101,6 +106,8 @@ def propagate_masks(
         # Fallback: copy anchor mask to all frames
         mask_img = (anchor_mask * 255).astype(np.uint8)
         for i, _ in enumerate(frame_files, start=1):
+            if cancel_check and cancel_check():
+                raise PropagationCancelled()
             mask_path = masks_dir / f"mask_{i:04d}.png"
             Image.fromarray(mask_img).save(mask_path)
         return len(frame_files)
@@ -147,6 +154,8 @@ def propagate_masks(
 
         # Forward propagation
         for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
+            if cancel_check and cancel_check():
+                raise PropagationCancelled()
             orig_idx = idx_map[frame_idx]
             propagated[orig_idx] = (mask_logits[0] > 0.0).cpu().numpy().squeeze()
 
@@ -155,12 +164,16 @@ def propagate_masks(
             for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(
                 inference_state, reverse=True
             ):
+                if cancel_check and cancel_check():
+                    raise PropagationCancelled()
                 orig_idx = idx_map[frame_idx]
                 propagated[orig_idx] = (mask_logits[0] > 0.0).cpu().numpy().squeeze()
 
     # Save masks for ALL frames, using nearest propagated mask for skipped frames
     propagated_indices = sorted(propagated.keys())
     for i in range(total):
+        if cancel_check and cancel_check():
+            raise PropagationCancelled()
         mask_path = masks_dir / f"mask_{i + 1:04d}.png"
         if i in propagated:
             mask_data = propagated[i]

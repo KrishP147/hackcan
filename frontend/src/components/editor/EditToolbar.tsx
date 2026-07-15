@@ -122,7 +122,7 @@ export function EditToolbar({ objectLabel, active, hasMask, editApplied, onApply
                   key={opt.id}
                   disabled={!enabled}
                   onClick={() => {
-                    if (!opt.needsColor && !opt.needsPrompt && !opt.needsScale) {
+                    if (!opt.needsColor && !opt.needsPrompt && !opt.needsScale && !opt.needsOffset) {
                       onApply(opt.id, {});
                     } else {
                       setSelected(opt);
@@ -159,7 +159,7 @@ export function EditToolbar({ objectLabel, active, hasMask, editApplied, onApply
                   key={opt.id}
                   disabled={!active}
                   onClick={() => {
-                    if (!opt.needsColor && !opt.needsPrompt && !opt.needsScale) {
+                    if (!opt.needsColor && !opt.needsPrompt && !opt.needsScale && !opt.needsOffset) {
                       onApply(opt.id, {});
                     } else {
                       setSelected(opt);

@@ -6,6 +6,9 @@ export async function PATCH(
   req: NextRequest,
   { params }: { params: Promise<{ projectId: string }> }
 ) {
+  if (!supabaseAdmin) {
+    return NextResponse.json({ error: "Project sync is not configured" }, { status: 503 });
+  }
   const session = await auth0.getSession();
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
@@ -35,6 +38,9 @@ export async function DELETE(
   _req: NextRequest,
   { params }: { params: Promise<{ projectId: string }> }
 ) {
+  if (!supabaseAdmin) {
+    return NextResponse.json({ error: "Project sync is not configured" }, { status: 503 });
+  }
   const session = await auth0.getSession();
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 

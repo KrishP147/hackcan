@@ -5,6 +5,11 @@ import { auth0 } from "@/lib/auth0";
 const PROTECTED = ["/dashboard"];
 
 export async function middleware(req: NextRequest) {
+  // Local demo mode: Auth0 is optional until production credentials exist.
+  if (!process.env.AUTH0_DOMAIN || !process.env.AUTH0_CLIENT_ID || !process.env.AUTH0_SECRET) {
+    return NextResponse.next();
+  }
+
   // Let Auth0 handle its own routes first
   const authResponse = await auth0.middleware(req);
 

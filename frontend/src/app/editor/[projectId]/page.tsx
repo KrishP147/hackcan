@@ -6,6 +6,7 @@ import { EditorTimeline } from "@/components/editor/EditorTimeline";
 import { EditToolbar } from "@/components/editor/EditToolbar";
 import { Toast } from "@/components/editor/Toast";
 import { EditProgressOverlay } from "@/components/editor/EditProgressOverlay";
+import { ExportProgressOverlay } from "@/components/editor/ExportProgressOverlay";
 import { useEditorState } from "@/hooks/useEditorState";
 import { useProjectSync } from "@/hooks/useProjectSync";
 import { useEffect, useRef, useState } from "react";
@@ -139,7 +140,7 @@ export default function EditorPage() {
               ? editor.detections.find((d) => d.id === editor.selectedObjectId)?.label || "object"
               : "selection"
           }
-          active={!editor.isSegmenting && editor.videoLoaded}
+          active={!editor.isSegmenting && !editor.isProcessing && editor.videoLoaded}
           hasMask={editor.maskCount > 0}
           editApplied={editor.editVersion > 0}
           onApply={editor.applyEditAction}
@@ -177,6 +178,11 @@ export default function EditorPage() {
         show={editor.isProcessing}
         progress={editor.editProgress}
         status={editor.editStatus}
+      />
+
+      <ExportProgressOverlay
+        show={editor.isExporting}
+        videoName={editor.videoName}
       />
     </div>
   );

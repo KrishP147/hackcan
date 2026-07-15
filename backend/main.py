@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, Depends
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from dotenv import load_dotenv
@@ -6,12 +6,13 @@ from pydantic import BaseModel
 from typing import Optional, List
 import shutil
 import asyncio
+from functools import partial
 import numpy as np
 import uuid
 from pathlib import Path
 from io import BytesIO
 
-from services import cloudinary_service, project_manager, ffmpeg_service, sam2_service
+from services import project_manager, ffmpeg_service, sam2_service, config
 from services.auth_service import get_current_user
 # film_service  # FILM disabled - using RIFE instead
 
@@ -56,11 +57,12 @@ if _os.getenv("RATE_LIMIT", "0") == "1":
 @app.on_event("startup")
 async def startup():
     project_manager.reset_stuck_projects()
+    print(f"[Startup] compute device: {config.get_device()}")
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "compute_device": str(config.get_device())}
 
 
 # --- Upload ---
@@ -81,10 +83,23 @@ async def upload_video(
     with open(video_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    # Video uploaded and staged for Cloudinary processing
+    # Video is staged on the local project volume for FFmpeg processing.
     return {
         "project_id": project["project_id"],
     }
+
+
+@app.post("/demo")
+async def load_demo_video():
+    """Create a local project from the bundled demo clip for presentations."""
+    source = Path(__file__).resolve().parent / "input" / "15454886_2560_1440_60fps.mp4"
+    if not source.exists():
+        raise HTTPException(status_code=404, detail="Bundled demo video is missing")
+
+    project = project_manager.create_project()
+    project_dir = project_manager.get_project_dir(project["project_id"])
+    shutil.copy2(source, project_dir / "original.mp4")
+    return {"project_id": project["project_id"], "video_name": "FrameShift-demo.mp4"}
 
 
 # --- Extract ---
@@ -223,7 +238,7 @@ class SegmentRequest(BaseModel):
     click_y: int
 
 async def _background_segment_and_propagate(project_id: str, frame_index: int, click_x: int, click_y: int):
-    """Background task: segment only the clicked frame (no propagation)."""
+    """Segment the anchor, then cache a full-clip mask track for later edits."""
     try:
         project_dir = project_manager.get_project_dir(project_id)
         frames_dir = project_dir / "frames"
@@ -240,7 +255,12 @@ async def _background_segment_and_propagate(project_id: str, frame_index: int, c
             )
             return
 
-        project_manager.update_status(project_id, segmenting=True, segment_status="segmenting")
+        project_manager.update_status(
+            project_id,
+            segmenting=True,
+            segment_status="segmenting",
+            segment_error=None,
+        )
 
         print(f"[SAM2] Starting segmentation for frame {frame_index} at ({click_x}, {click_y})")
         
@@ -257,6 +277,10 @@ async def _background_segment_and_propagate(project_id: str, frame_index: int, c
 
         # Save mask for this frame only
         from PIL import Image
+        # A new click starts a new object track. Do not let masks from a
+        # previous selection make the next edit skip propagation.
+        for old_mask in masks_dir.glob("mask_*.png"):
+            old_mask.unlink()
         mask_img = (mask.astype(np.uint8)) * 255
         mask_path = masks_dir / f"mask_{frame_index:04d}.png"
         Image.fromarray(mask_img).save(mask_path)
@@ -264,21 +288,43 @@ async def _background_segment_and_propagate(project_id: str, frame_index: int, c
         mask_service.condition_single(mask_path)
         print(f"[SAM2] Saved mask to {mask_path}")
 
-        # Count existing masks to update mask_count
-        existing_masks = list(masks_dir.glob("mask_*.png"))
-        mask_count = len(existing_masks)
-
         project_manager.update_status(
-            project_id, segmenting=False, segment_status="done",
-            mask_count=mask_count, anchor_frame=frame_index,
+            project_id, segmenting=True, segment_status="propagating",
+            mask_count=1, anchor_frame=frame_index,
             click_x=click_x, click_y=click_y,
+            segment_error=None,
         )
-        print(f"[SAM2] Segmentation complete for frame {frame_index}")
-        print(f"[SAM2] Updated status: segmenting=False, segment_status=done, mask_count={mask_count}")
+
+        # Selection owns mask propagation. Every edit after this point reads
+        # the cached full-clip mask sequence instead of invoking SAM2 again.
+        propagate = partial(
+            sam2_service.propagate_masks,
+            frames_dir,
+            frame_index,
+            (np.array(Image.open(mask_path).convert("L")) > 128),
+            masks_dir,
+            click_x=click_x,
+            click_y=click_y,
+            frame_step=config.get_mask_frame_step(),
+            cancel_check=lambda: _cancel_flags.get(project_id, False),
+        )
+        mask_count = await loop.run_in_executor(None, propagate)
+        mask_service.stabilize_masks(masks_dir)
+        project_manager.update_status(
+            project_id,
+            segmenting=False,
+            segment_status="done",
+            mask_count=mask_count,
+            segment_error=None,
+        )
+        print(f"[SAM2] Full mask propagation complete: {mask_count} frames")
         
         # Verify status was saved correctly
         saved_status = project_manager.get_status(project_id)
         print(f"[SAM2] Status after save: segmenting={saved_status.get('segmenting')}, segment_status={saved_status.get('segment_status')}, mask_count={saved_status.get('mask_count')}")
+    except sam2_service.PropagationCancelled:
+        project_manager.update_status(
+            project_id, segmenting=False, segment_status="cancelled")
     except Exception as e:
         import traceback
         error_trace = traceback.format_exc()
@@ -299,9 +345,25 @@ async def segment_object(req: SegmentRequest, background_tasks: BackgroundTasks)
     project_dir = project_manager.get_project_dir(req.project_id)
     frame_path = project_dir / "frames" / f"frame_{req.frame_index:04d}.jpg"
 
+    current_status = project_manager.get_status(req.project_id)
+    if current_status.get("segment_status") in {"segmenting", "propagating"} or current_status.get("segmenting"):
+        return {"error": "Segmentation is already in progress."}
+    if current_status.get("edit_status") in {"uploading", "editing", "processing"}:
+        return {"error": "Wait for the current edit to finish before segmenting again."}
+
     if not frame_path.exists():
         print(f"[SAM2] Error: Frame not found at {frame_path}")
         return {"error": "Frame not found"}
+
+    # Mark the new request before scheduling the background task. This prevents
+    # polling from briefly treating a second click as the previous completed mask.
+    project_manager.update_status(
+        req.project_id,
+        segmenting=True,
+        segment_status="segmenting",
+        segment_error=None,
+    )
+    _cancel_flags[req.project_id] = False
 
     background_tasks.add_task(
         _background_segment_and_propagate,
@@ -371,31 +433,69 @@ async def _background_edit(project_id: str, edit_rules: List[EditRule]):
             if frame_path.exists():
                 shutil.copy2(str(frame_path), str(backup_dir / f"frame_{idx:04d}.jpg"))
 
+        total_frames = sum(
+            max(0, rule.end_frame - rule.start_frame + 1)
+            for rule in edit_rules
+        )
         project_manager.update_status(
             project_id,
             last_backup_timestamp=backup_timestamp,
             last_backup_frames=sorted(frames_to_edit),
-            edit_status="processing",
-            edit_progress={"done": 0, "total": len(edit_rules)},
+            edit_status="editing",
+            edit_error=None,
+            edit_phase="tracking",
+            edit_progress={"done": 0, "total": total_frames},
             edit_sweep=None,
         )
 
         from services import edit_dispatch
-        for n, rule in enumerate(edit_rules, 1):
+        completed_frames = 0
+        for rule in edit_rules:
             if _cancel_flags.get(project_id):
                 project_manager.update_status(project_id, edit_status="cancelled")
                 return
-            await edit_dispatch.run_edit_rule(project_id, rule)
+
+            rule_total = max(0, rule.end_frame - rule.start_frame + 1)
+
+            def update_progress(done: int, _total: int, base=completed_frames):
+                project_manager.update_status(
+                    project_id,
+                    edit_progress={
+                        "done": min(base + done, total_frames),
+                        "total": total_frames,
+                    },
+                )
+
+            await edit_dispatch.run_edit_rule(
+                project_id, rule,
+                progress_cb=update_progress,
+                cancel_check=lambda: _cancel_flags.get(project_id, False),
+            )
+            if _cancel_flags.get(project_id):
+                project_manager.update_status(project_id, edit_status="cancelled")
+                return
+            project_manager.update_status(project_id, edit_phase="editing")
+            completed_frames += rule_total
             project_manager.update_status(
-                project_id, edit_progress={"done": n, "total": len(edit_rules)})
+                project_id,
+                edit_progress={"done": completed_frames, "total": total_frames},
+            )
 
         project_manager.update_status(
             project_id, edit_status="done",
-            edit_progress={"done": len(edit_rules), "total": len(edit_rules)})
+            edit_phase="done",
+            edit_progress={"done": total_frames, "total": total_frames},
+            edit_version=(project_manager.get_status(project_id).get("edit_version", 0) or 0) + 1,
+        )
     except Exception as e:
+        from services import edit_dispatch, sam2_service
+        if isinstance(e, (edit_dispatch.EditCancelled, sam2_service.PropagationCancelled)):
+            project_manager.update_status(project_id, edit_status="cancelled")
+            return
         import traceback
         traceback.print_exc()
-        project_manager.update_status(project_id, edit_status="error", edit_error=str(e))
+        project_manager.update_status(
+            project_id, edit_status="error", edit_phase="error", edit_error=str(e))
 
 
 class UndoRequest(BaseModel):
@@ -450,10 +550,20 @@ async def edit_frames(req: EditRequest):
     project_dir = project_manager.get_project_dir(req.project_id)
     if not any((project_dir / "frames").glob("frame_*.jpg")):
         return {"error": "No frames found. Run /extract first."}
+    if not req.edit_rules:
+        return {"error": "No edit rules provided."}
+
+    current_status = project_manager.get_status(req.project_id)
+    if current_status.get("segment_status") in {"segmenting", "propagating"} or current_status.get("segmenting"):
+        return {"error": "Wait for segmentation to finish before applying Blur."}
+    if current_status.get("edit_status") in {"uploading", "editing", "processing"}:
+        return {"error": "An edit is already being applied."}
 
     project_manager.update_status(
         req.project_id,
         edit_status="editing",
+        edit_error=None,
+        edit_phase="tracking",
         edit_progress={"done": 0, "total": 0},
         edit_sweep=None,
     )

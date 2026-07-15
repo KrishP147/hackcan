@@ -2,17 +2,17 @@
 Backend A is torch-native; Doc 2's CUDA kernels are dev-only and flag-guarded.
 
 Deploy:  modal deploy modal_app.py   (requires `modal token new` first)
-Secrets: create `frameshift-secrets` with GEMINI_API_KEY + CLOUDINARY_URL.
+Secrets: create `frameshift-secrets` with GEMINI_API_KEY if generative edits are enabled.
 """
 import modal
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg", "libgl1", "libglib2.0-0")
+    .pip_install_from_requirements("requirements.txt")
     .pip_install(
         "torch==2.10.0", "torchvision==0.25.0",
         extra_index_url="https://download.pytorch.org/whl/cu121")
-    .pip_install_from_requirements("requirements.txt")
     .add_local_dir("services", "/root/services")
     .add_local_file("main.py", "/root/main.py")
     .add_local_dir("checkpoints", "/root/checkpoints")
@@ -38,6 +38,7 @@ class Server:
         import torch
         from services import flow_service, sam2_service
         sam2_service.get_image_predictor()
+        sam2_service.get_video_predictor()
         flow_service._build_raft(torch.device("cuda"))
 
     @modal.asgi_app()

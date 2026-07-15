@@ -24,6 +24,10 @@ DETERMINISTIC = {"recolor", "blur_region", "color_pop", "glow"}
 INPAINT_MARGIN = 8  # temporal inpainter reaches ±8 donor frames outside the range
 
 
+class EditCancelled(RuntimeError):
+    """Raised between frames when the user cancels an edit job."""
+
+
 def _project_dir(project_id: str) -> Path:
     return project_manager.get_project_dir(project_id)
 
@@ -37,7 +41,8 @@ def _ensure_flows(project_dir: Path, start: int, end: int):
                                end=end + INPAINT_MARGIN)
 
 
-def _ensure_masks(project_id: str, project_dir: Path, start: int, end: int):
+def _ensure_masks(project_id: str, project_dir: Path, start: int, end: int,
+                  cancel_check=None):
     """SAM 2-propagate masks over any frames in range that lack one, then stabilize."""
     masks_dir = project_dir / "masks"
     missing = [t for t in range(start, end + 1)
@@ -55,8 +60,12 @@ def _ensure_masks(project_id: str, project_dir: Path, start: int, end: int):
     sam2_service.propagate_masks(
         project_dir / "frames", anchor, anchor_mask, masks_dir,
         click_x=status.get("click_x"), click_y=status.get("click_y"),
-        frame_step=1)
+        frame_step=config.get_mask_frame_step(), cancel_check=cancel_check)
     mask_service.stabilize_masks(masks_dir)
+    project_manager.update_status(
+        project_id,
+        mask_count=len(list(masks_dir.glob("mask_*.png"))),
+    )
 
 
 class _Sweep:
@@ -90,8 +99,11 @@ def _anchor_out(indices: list[int], center: int) -> list[int]:
     return sorted(indices, key=lambda t: (abs(t - center), t))
 
 
-def _run_deterministic(rule, project_dir: Path, ordered: list[int], sweep: _Sweep):
+def _run_deterministic(rule, project_dir: Path, ordered: list[int], sweep: _Sweep,
+                       cancel_check=None):
     for t in ordered:
+        if cancel_check and cancel_check():
+            raise EditCancelled()
         fp = project_dir / "frames" / f"frame_{t:04d}.jpg"
         mp = project_dir / "masks" / f"mask_{t:04d}.png"
         if not fp.exists():
@@ -107,9 +119,10 @@ def _run_deterministic(rule, project_dir: Path, ordered: list[int], sweep: _Swee
         sweep.frame_done(t)
 
 
-async def run_edit_rule(project_id: str, rule, progress_cb=None) -> None:
+async def run_edit_rule(project_id: str, rule, progress_cb=None, cancel_check=None) -> None:
     project_dir = _project_dir(project_id)
     device = config.get_device()
+    loop = asyncio.get_running_loop()
     indices = list(range(rule.start_frame, rule.end_frame + 1))
     status = project_manager.get_status(project_id)
     anchor = status.get("anchor_frame") or rule.start_frame
@@ -120,9 +133,11 @@ async def run_edit_rule(project_id: str, rule, progress_cb=None) -> None:
 
     if rule.edit_type in DETERMINISTIC:
         await asyncio.to_thread(
-            _ensure_masks, project_id, project_dir, rule.start_frame, rule.end_frame)
+            _ensure_masks, project_id, project_dir, rule.start_frame, rule.end_frame,
+            cancel_check)
         await asyncio.to_thread(
-            _run_deterministic, rule, project_dir, _anchor_out(indices, center), sweep)
+            _run_deterministic, rule, project_dir, _anchor_out(indices, center), sweep,
+            cancel_check)
         if progress_cb:
             progress_cb(len(indices), len(indices))
         return
@@ -132,7 +147,8 @@ async def run_edit_rule(project_id: str, rule, progress_cb=None) -> None:
         await asyncio.to_thread(
             _ensure_flows, project_dir, rule.start_frame, rule.end_frame)
     await asyncio.to_thread(
-        _ensure_masks, project_id, project_dir, rule.start_frame, rule.end_frame)
+        _ensure_masks, project_id, project_dir, rule.start_frame, rule.end_frame,
+        cancel_check)
 
     if rule.edit_type == "delete":
         await asyncio.to_thread(object_tools.apply_delete_range,

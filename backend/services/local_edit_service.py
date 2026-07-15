@@ -39,8 +39,9 @@ def apply_recolor(frame_path: Path, mask_path: Path, color_hex: str) -> None:
 def apply_blur_region(frame_path: Path, mask_path: Path, strength: int = 10) -> None:
     """Blur only the masked region."""
     original = np.array(Image.open(frame_path).convert("RGB"))
-    mask = _load_mask(mask_path, original.shape)
-    alpha = _get_mask_alpha(mask)
+    # Feather the boundary so the blur does not produce a hard rectangular
+    # cut line as the tracked mask moves frame-to-frame.
+    alpha = _feathered_alpha(mask_path, original.shape, feather_px=3)[..., None]
     
     # Apply blur to entire image
     img = Image.fromarray(original)

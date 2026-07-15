@@ -62,14 +62,14 @@ One click propagates your edit across the entire frame range. Preview the result
 | Generative Edits | Gemini (keyframes) |
 | Frame Interpolation | RIFE (FILM optional fallback) |
 | Inpainting / Local Edits | OpenCV (TELEA) |
-| Storage & Media | Cloudinary |
+| Storage & Media | Mounted project volume + local filesystem |
 | Database | Supabase (Postgres) |
 | Frame Processing | FFmpeg |
 
 ## Architecture
 
 ```
-Video Upload → Cloudinary Storage → FFmpeg Frame Extraction → YOLOv11 Detection
+Video Upload → Project Volume → FFmpeg Frame Extraction → YOLOv11 Detection
                                               ↓
               Click Object → SAM 2 Segmentation + Mask Propagation
                                               ↓
@@ -77,7 +77,7 @@ Video Upload → Cloudinary Storage → FFmpeg Frame Extraction → YOLOv11 Dete
         │       → mask-based alpha compositing → RIFE interpolates the gaps
         └─ Local edits: OpenCV per frame (TELEA inpainting, recolor, blur, resize)
                                               ↓
-              FFmpeg Re-encode → Final Video via Cloudinary
+              FFmpeg Re-encode → Final Video on the project volume
 ```
 
 For a deep dive into how each stage works (video codecs, SAM 2's memory mechanism, diffusion models, RIFE, TELEA, and where their assumptions conflict), see [docs/Technical-Overview.md](docs/Technical-Overview.md).
@@ -120,7 +120,7 @@ Describe your edit in natural language (e.g., *"make the person in the middle re
 - Node.js 18+
 - Python 3.10+
 - [FFmpeg](https://ffmpeg.org/download.html) installed and on PATH
-- Cloudinary account
+- Durable production volume mounted at the projects path
 - Supabase project
 - Auth0 application
 
@@ -144,9 +144,6 @@ curl -L -o checkpoints/sam2_hiera_tiny.pt \
 Create `backend/.env`:
 
 ```env
-CLOUDINARY_CLOUD_NAME=your_cloud_name
-CLOUDINARY_API_KEY=your_api_key
-CLOUDINARY_API_SECRET=your_api_secret
 SUPABASE_URL=your_supabase_url
 SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
 AUTH0_DOMAIN=your_auth0_domain
@@ -170,6 +167,7 @@ Create `frontend/.env.local`:
 
 ```env
 NEXT_PUBLIC_API_URL=http://localhost:8000
+NEXT_PUBLIC_PROFILE_ROUTE=/api/auth/profile
 AUTH0_SECRET=your_secret
 AUTH0_BASE_URL=http://localhost:3000
 AUTH0_ISSUER_BASE_URL=https://your-tenant.us.auth0.com
@@ -177,8 +175,6 @@ AUTH0_CLIENT_ID=your_client_id
 AUTH0_CLIENT_SECRET=your_client_secret
 NEXT_PUBLIC_SUPABASE_URL=your_supabase_url
 SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
-NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME=your_cloud_name
-NEXT_PUBLIC_CLOUDINARY_UPLOAD_PRESET=your_upload_preset
 ```
 
 Start the dev server:
@@ -193,11 +189,11 @@ App runs at [http://localhost:3000](http://localhost:3000).
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/upload` | Create project, upload video to Cloudinary |
+| `POST` | `/upload` | Create project, store video on the project volume |
 | `POST` | `/extract` | Extract frames with FFmpeg, run YOLO detection |
 | `GET` | `/project/{id}/status` | Poll extraction status and frame count |
 | `GET` | `/frame/{id}/{index}` | Serve a specific frame as JPEG |
 | `POST` | `/detect` | On-demand YOLO detection for a single frame |
 | `POST` | `/segment` | SAM 2 segmentation + propagation |
 | `POST` | `/edit` | Apply batch edit rules across frame ranges |
-| `POST` | `/render` | Re-encode video with FFmpeg, upload to Cloudinary |
+| `POST` | `/render` | Re-encode video with FFmpeg and store the result on the project volume |
