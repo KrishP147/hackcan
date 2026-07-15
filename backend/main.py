@@ -499,6 +499,37 @@ async def get_mask(project_id: str, mask_index: int):
     return FileResponse(mask_path, media_type="image/png")
 
 
+@app.get("/mask-outline/{project_id}/{mask_index}")
+async def get_mask_outline(project_id: str, mask_index: int):
+    """Transparent accent contour for responsive editor playback."""
+    from fastapi.responses import Response
+    import cv2
+
+    project_dir = project_manager.get_project_dir(project_id)
+    mask_path = project_dir / "masks" / f"mask_{mask_index:04d}.png"
+    mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        raise HTTPException(status_code=404, detail="Mask not found")
+
+    hard = (mask > 128).astype(np.uint8) * 255
+    edge = cv2.morphologyEx(
+        hard,
+        cv2.MORPH_GRADIENT,
+        np.ones((3, 3), dtype=np.uint8),
+    )
+    rgba = np.zeros((*hard.shape, 4), dtype=np.uint8)
+    # OpenCV encodes BGRA; the FrameShift accent is RGB(244, 63, 94).
+    rgba[edge > 0] = (94, 63, 244, 255)
+    ok, encoded = cv2.imencode(".png", rgba)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Could not render mask outline")
+    return Response(
+        content=encoded.tobytes(),
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
 # --- Edit ---
 
 class EditRule(BaseModel):
@@ -826,6 +857,15 @@ async def cancel_edit(req: CancelRequest):
         refine_status="cancelled",
         ai_edit_status="cancelled",
     )
+    return {"status": "cancelled"}
+
+
+@app.post("/edit/preview/cancel")
+async def cancel_edit_preview(req: CancelRequest):
+    """Discard a prepared keyframe preview without touching project frames."""
+    project_dir = project_manager.get_project_dir(req.project_id)
+    (project_dir / "pending" / "edit_anchor.jpg").unlink(missing_ok=True)
+    project_manager.update_status(req.project_id, pending_edit_preview=None)
     return {"status": "cancelled"}
 
 

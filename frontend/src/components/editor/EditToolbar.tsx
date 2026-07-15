@@ -314,7 +314,7 @@ export function EditToolbar({ objectLabel, active, hasMask, editApplied, onApply
             onMouseEnter={(e) => (e.currentTarget.style.background = "var(--accent-hover)")}
             onMouseLeave={(e) => (e.currentTarget.style.background = "var(--accent)")}
           >
-            Apply {selected.label}
+            Preview {selected.label}
           </button>
         </div>
       )}

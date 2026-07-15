@@ -37,8 +37,6 @@ export default function EditorPage() {
     }
   }, [projectId, setCurrentProject]);
   const playIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const rafRef = useRef<number | null>(null);
-  const lastFrameTimeRef = useRef<number>(0);
   const currentFrameRef = useRef(editor.currentFrame);
   const framesLengthRef = useRef(editor.frames.length);
   const [isDark, setIsDark] = useState(false);
@@ -46,19 +44,29 @@ export default function EditorPage() {
   // Playback loop — 15 fps so frames have time to load
   const playbackFps = 15;
   useEffect(() => {
+    currentFrameRef.current = editor.currentFrame;
+  }, [editor.currentFrame]);
+
+  useEffect(() => {
+    framesLengthRef.current = editor.frames.length;
+  }, [editor.frames.length]);
+
+  useEffect(() => {
     if (editor.isPlaying && editor.videoLoaded) {
       playIntervalRef.current = setInterval(() => {
-        editor.setCurrentFrame(
-          editor.currentFrame >= editor.frames.length - 1
-            ? 0
-            : editor.currentFrame + 1
-        );
+        const frameCount = framesLengthRef.current;
+        if (frameCount <= 0) return;
+        const nextFrame = currentFrameRef.current >= frameCount - 1
+          ? 0
+          : currentFrameRef.current + 1;
+        currentFrameRef.current = nextFrame;
+        editor.setCurrentFrame(nextFrame);
       }, 1000 / playbackFps);
     }
     return () => {
       if (playIntervalRef.current) clearInterval(playIntervalRef.current);
     };
-  }, [editor.isPlaying, editor.videoLoaded, editor.currentFrame, editor.frames.length, editor.setCurrentFrame]);
+  }, [editor.isPlaying, editor.videoLoaded, editor.setCurrentFrame]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -128,6 +136,8 @@ export default function EditorPage() {
           previewFrameUrl={editor.aiPreviewFrameUrl}
           instantPreviewUrl={editor.instantPreviewUrl}
           instantPreviewFrame={editor.instantPreviewFrame}
+          pendingEditAction={editor.pendingEdit?.action ?? null}
+          isEditPreviewing={editor.isEditPreviewing}
           aiEditStatus={editor.aiEditStatus}
           storageBaseUrl={editor.storageBaseUrl}
           onSelectObject={editor.selectObject}
@@ -135,6 +145,8 @@ export default function EditorPage() {
           onApplyEdit={editor.applyEditAction}
           onSegmentAtPoint={editor.segmentAtPoint}
           onConfirmPropagation={editor.confirmSegmentPropagation}
+          onConfirmEditPropagation={editor.confirmEditPropagation}
+          onCancelEditPreview={editor.cancelEditPreview}
           onCancelEdit={editor.cancelEdit}
         />
 
@@ -144,7 +156,7 @@ export default function EditorPage() {
               ? editor.detections.find((d) => d.id === editor.selectedObjectId)?.label || "object"
               : "selection"
           }
-          active={!editor.isSegmenting && !editor.isProcessing && editor.videoLoaded && editor.segmentStatus !== "keyframe_ready"}
+          active={!editor.isSegmenting && !editor.isProcessing && !editor.isEditPreviewing && !editor.pendingEdit && editor.videoLoaded && editor.segmentStatus !== "keyframe_ready"}
           hasMask={editor.maskCount > 0}
           editApplied={editor.editVersion > 0}
           onApply={editor.applyEditAction}
@@ -182,6 +194,7 @@ export default function EditorPage() {
         show={editor.isProcessing}
         progress={editor.editProgress}
         status={editor.editStatus}
+        phase={editor.editPhase}
       />
 
       <ExportProgressOverlay

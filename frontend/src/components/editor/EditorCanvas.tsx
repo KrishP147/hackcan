@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef, useEffect } from "react";
+import { useCallback, useRef } from "react";
 import type { Detection, EditMode, EditParams } from "@/lib/mock-data";
 import { BoundingBox } from "./BoundingBox";
 import type { EditAction } from "./EditToolbar";
@@ -31,6 +31,8 @@ interface EditorCanvasProps {
   previewFrameUrl: string | null;
   instantPreviewUrl?: string | null;
   instantPreviewFrame?: number | null;
+  pendingEditAction?: string | null;
+  isEditPreviewing?: boolean;
   aiEditStatus: "idle" | "preview" | "applying" | "done";
   storageBaseUrl: string | null;
   onSelectObject: (id: string | null) => void;
@@ -38,8 +40,22 @@ interface EditorCanvasProps {
   onApplyEdit: (action: EditAction, params: { color?: string; prompt?: string; scale?: number }) => void;
   onSegmentAtPoint: (clickX: number, clickY: number) => void;
   onConfirmPropagation: () => void;
+  onConfirmEditPropagation: () => void;
+  onCancelEditPreview: () => void;
   onCancelEdit: () => void;
 }
+
+const EDIT_LABELS: Record<string, string> = {
+  delete: "Remove",
+  recolor: "Recolor",
+  resize: "Resize",
+  blur_region: "Blur",
+  move: "Move",
+  color_pop: "Color Pop",
+  glow: "Glow",
+  replace: "Replace",
+  bg_replace: "Replace Background",
+};
 
 export function EditorCanvas({
   projectId,
@@ -65,6 +81,8 @@ export function EditorCanvas({
   previewFrameUrl,
   instantPreviewUrl,
   instantPreviewFrame,
+  pendingEditAction,
+  isEditPreviewing,
   aiEditStatus,
   storageBaseUrl,
   onSelectObject,
@@ -72,10 +90,11 @@ export function EditorCanvas({
   onApplyEdit,
   onSegmentAtPoint,
   onConfirmPropagation,
+  onConfirmEditPropagation,
+  onCancelEditPreview,
   onCancelEdit,
 }: EditorCanvasProps) {
   const imgRef = useRef<HTMLDivElement>(null);
-  const borderCanvasRef = useRef<HTMLCanvasElement>(null);
   const hasMaskForCurrentFrame = maskCount > 0 && (
     segmentStatus === "done" || segmentAnchorFrame === currentFrame + 1
   );
@@ -97,82 +116,6 @@ export function EditorCanvas({
     },
     [frameWidth, frameHeight, isProcessing, isSegmenting, onSegmentAtPoint]
   );
-
-  // Draw border outline on canvas when mask exists
-  useEffect(() => {
-    if (!borderCanvasRef.current) {
-      return;
-    }
-
-    const canvas = borderCanvasRef.current;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    if (!projectId || !hasMaskForCurrentFrame || isSegmenting || aiEditStatus === "preview") {
-      return;
-    }
-
-    // Set canvas size to match container
-    const rect = canvas.getBoundingClientRect();
-    canvas.width = rect.width;
-    canvas.height = rect.height;
-
-    // Load mask image
-    const maskImg = new Image();
-    maskImg.crossOrigin = "anonymous";
-    maskImg.onload = () => {
-      // Clear canvas
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-      // Calculate scaling to fit mask in canvas
-      const scaleX = canvas.width / maskImg.width;
-      const scaleY = canvas.height / maskImg.height;
-      const scale = Math.min(scaleX, scaleY);
-      const x = (canvas.width - maskImg.width * scale) / 2;
-      const y = (canvas.height - maskImg.height * scale) / 2;
-
-      // Draw mask to get pixel data
-      ctx.drawImage(maskImg, x, y, maskImg.width * scale, maskImg.height * scale);
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const data = imageData.data;
-
-      // Clear canvas again
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-      // Find edges and draw glowing border
-      ctx.strokeStyle = "rgba(244,63,94,1)";
-      ctx.lineWidth = 3;
-      ctx.shadowBlur = 8;
-      ctx.shadowColor = "rgba(244,63,94,1)";
-
-      // Simple edge detection - draw border where mask pixels meet non-mask pixels
-      for (let y = 1; y < canvas.height - 1; y++) {
-        for (let x = 1; x < canvas.width - 1; x++) {
-          const idx = (y * canvas.width + x) * 4;
-          const isMask = data[idx] > 128; // White pixel in mask
-
-          // Check neighbors
-          const topIdx = ((y - 1) * canvas.width + x) * 4;
-          const bottomIdx = ((y + 1) * canvas.width + x) * 4;
-          const leftIdx = (y * canvas.width + (x - 1)) * 4;
-          const rightIdx = (y * canvas.width + (x + 1)) * 4;
-
-          const topIsMask = data[topIdx] > 128;
-          const bottomIsMask = data[bottomIdx] > 128;
-          const leftIsMask = data[leftIdx] > 128;
-          const rightIsMask = data[rightIdx] > 128;
-
-          // Draw pixel if it's on the edge
-          if (isMask && (!topIsMask || !bottomIsMask || !leftIsMask || !rightIsMask)) {
-            ctx.fillStyle = "rgba(244,63,94,1)";
-            ctx.fillRect(x, y, 1, 1);
-          }
-        }
-      }
-    };
-    maskImg.src = `${API_URL}/mask/${projectId}/${currentFrame + 1}?v=${maskVersion}`;
-  }, [projectId, currentFrame, hasMaskForCurrentFrame, maskVersion, isSegmenting, aiEditStatus, frameWidth, frameHeight]);
 
   if (!videoLoaded) {
     return <EmptyCanvas onUpload={onUpload} />;
@@ -260,11 +203,11 @@ export function EditorCanvas({
           {/* Hide masks and detections when showing AI preview */}
           {aiEditStatus !== "preview" && projectId && hasMaskForCurrentFrame && !isSegmenting && (
             <>
-              {/* Draw border outline on canvas - no mask overlay */}
-              <canvas
-                ref={borderCanvasRef}
-                className="absolute inset-0 w-full h-full pointer-events-none z-[2]"
-                style={{ objectFit: "contain" }}
+              <img
+                src={`${API_URL}/mask-outline/${projectId}/${currentFrameIndex}?v=${maskVersion}`}
+                alt=""
+                className="absolute inset-0 w-full h-full object-contain pointer-events-none z-[2]"
+                style={{ filter: "drop-shadow(0 0 3px rgba(244,63,94,0.9))" }}
               />
 
             </>
@@ -280,6 +223,21 @@ export function EditorCanvas({
                 <span className="text-white/70 text-xs font-medium">
                   {segmentStatus === "propagating" ? "Tracking object through video…" : "Segmenting keyframe…"}
                 </span>
+              </div>
+            </div>
+          )}
+
+          {isEditPreviewing && (
+            <div className="absolute inset-0 flex items-center justify-center z-30 pointer-events-none">
+              <div
+                className="flex flex-col items-center gap-2 px-5 py-3.5 rounded-2xl border"
+                style={{ background: "rgba(0,0,0,0.76)", borderColor: "rgba(255,255,255,0.12)" }}
+              >
+                <div className="w-6 h-6 border-2 border-[var(--accent)] border-t-transparent rounded-full animate-spin" />
+                <span className="text-white/75 text-xs font-medium">
+                  Preparing {pendingEditAction ? EDIT_LABELS[pendingEditAction] || pendingEditAction : "edit"} preview…
+                </span>
+                <span className="text-white/40 text-[10px]">Current frame only</span>
               </div>
             </div>
           )}
@@ -309,6 +267,44 @@ export function EditorCanvas({
                   <p className="mt-2 text-center text-[10px] text-white/40">
                     Or click another point to adjust the selection
                   </p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {pendingEditAction && !isEditPreviewing && instantPreviewUrl && (
+            <div
+              className="absolute bottom-4 left-1/2 -translate-x-1/2 z-30 w-[380px] rounded-2xl border p-4 shadow-2xl backdrop-blur-xl"
+              style={{ background: "rgba(15,15,18,0.94)", borderColor: "rgba(255,255,255,0.14)" }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="flex items-start gap-3">
+                <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-400">
+                  ✓
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-semibold text-white">
+                    {EDIT_LABELS[pendingEditAction] || pendingEditAction} preview ready
+                  </p>
+                  <p className="mt-1 text-xs leading-5 text-white/60">
+                    Apply this change to all {totalFrames} frames?
+                  </p>
+                  <div className="mt-3 flex gap-2">
+                    <button
+                      type="button"
+                      onClick={onCancelEditPreview}
+                      className="flex-1 rounded-xl border border-white/15 px-4 py-2.5 text-xs font-semibold text-white/70 transition hover:bg-white/5"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      onClick={onConfirmEditPropagation}
+                      className="flex-[1.5] rounded-xl bg-[var(--accent)] px-4 py-2.5 text-xs font-semibold text-white transition hover:brightness-110"
+                    >
+                      Apply to all frames
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>

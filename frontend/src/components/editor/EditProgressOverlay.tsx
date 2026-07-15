@@ -6,6 +6,7 @@ interface EditProgressOverlayProps {
   show: boolean;
   progress: { done: number; total: number };
   status: "uploading" | "editing" | "done" | "error" | null;
+  phase?: string | null;
 }
 
 /**
@@ -13,14 +14,18 @@ interface EditProgressOverlayProps {
  * frame (instant preview) — this just shows the background sweep filling in
  * the rest of the clip, without covering the editor.
  */
-export function EditProgressOverlay({ show, progress, status }: EditProgressOverlayProps) {
+export function EditProgressOverlay({ show, progress, status, phase }: EditProgressOverlayProps) {
   if (!show) return null;
 
   const percentage = progress.total > 0
     ? Math.round((progress.done / progress.total) * 100)
     : 0;
 
-  const statusText = status === "uploading"
+  const statusText = phase === "optical_flow"
+    ? "Computing optical flow (RAFT)"
+    : phase === "propagating"
+    ? "Propagating edit with motion"
+    : status === "uploading"
     ? "Preparing frames..."
     : status === "editing"
     ? progress.done === 0 && progress.total > 0

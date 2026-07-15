@@ -18,6 +18,12 @@ interface PerFrameDetections {
   [frameKey: string]: { label: string; confidence: number; bbox: [number, number, number, number] }[];
 }
 
+interface PendingEdit {
+  action: string;
+  params: { color?: string; prompt?: string; scale?: number; dx?: number; dy?: number };
+  editRule: Record<string, unknown>;
+}
+
 interface EditorState {
   projectId: string | null;
   videoLoaded: boolean;
@@ -45,6 +51,7 @@ interface EditorState {
   isProcessing: boolean;
   editProgress: { done: number; total: number };
   editStatus: "uploading" | "editing" | "done" | "error" | null;
+  editPhase: string | null;
   applyToAllFrames: boolean;
   editRangeStart: number;
   editRangeEnd: number;
@@ -71,6 +78,8 @@ interface EditorState {
   isExporting: boolean;
   instantPreviewUrl: string | null;    // blob URL of the single-frame preview
   instantPreviewFrame: number | null;  // 0-based frame it belongs to
+  pendingEdit: PendingEdit | null;
+  isEditPreviewing: boolean;
 }
 
 // Edits with a sub-second single-frame preview; replace/bg_replace are generative
@@ -113,6 +122,7 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
     isProcessing: false,
     editProgress: { done: 0, total: 0 },
     editStatus: null,
+    editPhase: null,
     applyToAllFrames: true,
     editRangeStart: 0,
     editRangeEnd: 0,
@@ -133,6 +143,8 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
     isExporting: false,
     instantPreviewUrl: null,
     instantPreviewFrame: null,
+    pendingEdit: null,
+    isEditPreviewing: false,
   });
 
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -409,6 +421,7 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
                   editStatus: editProcessing
                     ? status.edit_status === "processing" ? "editing" : status.edit_status as "uploading" | "editing"
                     : editDone ? "done" : editError ? "error" : null,
+                  editPhase: status.edit_phase ?? s.editPhase,
                   editVersion: Math.max(
                     s.editVersion,
                     backendEditVersion,
@@ -619,6 +632,7 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
                 editStatus: editProcessing
                   ? status.edit_status === "processing" ? "editing" : status.edit_status as "uploading" | "editing"
                   : editDone ? "done" : editError ? "error" : null,
+                editPhase: status.edit_phase ?? s.editPhase,
                 editVersion: Math.max(
                   s.editVersion,
                   backendEditVersion,
@@ -846,7 +860,7 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
   const applyEditAction = useCallback(
     (action: string, params: { color?: string; prompt?: string; scale?: number; dx?: number; dy?: number }) => {
       const current = state;
-      if (!current.projectId || current.isProcessing || current.isSegmenting) return;
+      if (!current.projectId || current.isProcessing || current.isSegmenting || current.isEditPreviewing) return;
 
       const MASK_ACTIONS = new Set(["delete", "replace", "resize", "blur_region", "recolor", "move", "color_pop", "glow"]);
       const isMaskEdit = MASK_ACTIONS.has(action);
@@ -868,106 +882,160 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
       if (params.dx !== undefined) editRule.dx = params.dx;
       if (params.dy !== undefined) editRule.dy = params.dy;
 
-      // Instant single-frame preview: paint the effect on the visible frame
-      // in ~100-300ms while the full-clip propagation runs in the background
-      if (PREVIEWABLE_ACTIONS.has(action)) {
-        const previewFrame0 = current.currentFrame;
-        fetch(`${API_URL}/edit/preview`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            project_id: current.projectId,
-            frame_index: previewFrame0 + 1,
-            edit_type: action,
-            color: params.color,
-            scale: params.scale,
-            dx: params.dx,
-            dy: params.dy,
-          }),
-        })
-          .then(async (res) => {
-            if (!res.ok || !(res.headers.get("content-type") || "").includes("image")) return;
-            const blob = await res.blob();
-            const url = URL.createObjectURL(blob);
-            setState((prev) => {
-              // stale if another edit started or this one already finished
-              if (!prev.isProcessing) {
-                URL.revokeObjectURL(url);
-                return prev;
-              }
-              if (prev.instantPreviewUrl) URL.revokeObjectURL(prev.instantPreviewUrl);
-              return { ...prev, instantPreviewUrl: url, instantPreviewFrame: previewFrame0 };
-            });
-          })
-          .catch(() => { /* preview is best-effort; propagation still runs */ });
-      }
+      if (!PREVIEWABLE_ACTIONS.has(action)) return;
+      const previewFrame0 = current.currentFrame;
+      const pendingEdit: PendingEdit = { action, params: { ...params }, editRule };
 
-      const { addLog } = useChangeLogStore.getState();
-      addLog(current.projectId, {
-        projectId: current.projectId,
-        type: "edit",
-        frameIndex: current.currentFrame,
-        data: {
-          editType: action,
+      setState((s) => {
+        if (s.instantPreviewUrl) URL.revokeObjectURL(s.instantPreviewUrl);
+        return {
+          ...s,
+          isPlaying: false,
+          isEditPreviewing: true,
+          pendingEdit,
+          instantPreviewUrl: null,
+          instantPreviewFrame: previewFrame0,
+          selectedObjectId: null,
+          showEditPanel: false,
+        };
+      });
+
+      fetch(`${API_URL}/edit/preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_id: current.projectId,
+          frame_index: previewFrame0 + 1,
+          edit_type: action,
           color: params.color,
           prompt: params.prompt,
           scale: params.scale,
-          startFrame: startFrame - 1,
-          endFrame: endFrame - 1,
-        },
-      });
-
-      const markerId = `marker_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-      const newMarker = {
-        id: markerId,
-        frame: current.currentFrame,
-        editType: action,
-        timestamp: Date.now(),
-        params: { ...params },
-      };
-
-      // Submit once, outside the state updater. The backend owns propagation;
-      // Save/Export is only for producing the final MP4.
-      sweepMarkedRef.current = null;  // fresh sweep for this edit
-      fetch(`${API_URL}/edit`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project_id: current.projectId, edit_rules: [editRule] }),
+          dx: params.dx,
+          dy: params.dy,
+        }),
       })
         .then(async (res) => {
-          const data = await res.json();
-          if (!res.ok || data.error) {
-            throw new Error(data.error || `Edit request failed (${res.status})`);
+          const contentType = res.headers.get("content-type") || "";
+          if (!res.ok || !contentType.includes("image")) {
+            const data = await res.json().catch(() => ({}));
+            throw new Error(data.error || `Preview failed (${res.status})`);
           }
-          // Poll fast while the edit propagates so frames refresh as they land
-          if (pollingRef.current) {
-            clearInterval(pollingRef.current);
-            pollingRef.current = null;
-          }
-          restartPolling(500);
+          const url = URL.createObjectURL(await res.blob());
+          setState((s) => {
+            if (s.pendingEdit !== pendingEdit) {
+              URL.revokeObjectURL(url);
+              return s;
+            }
+            return {
+              ...s,
+              isEditPreviewing: false,
+              instantPreviewUrl: url,
+              instantPreviewFrame: previewFrame0,
+            };
+          });
         })
         .catch((err) => {
           setState((s) => ({
             ...s,
-            isProcessing: false,
+            isEditPreviewing: false,
+            pendingEdit: null,
+            instantPreviewFrame: null,
             editStatus: "error",
             showToast: true,
-            toastMessage: `Edit failed: ${err.message}`,
+            toastMessage: `Preview failed: ${err.message}`,
           }));
         });
-
-      setState((s) => ({
-        ...s,
-        isProcessing: true,
-        editStatus: "editing",
-        editProgress: { done: 0, total: endFrame - startFrame + 1 },
-        selectedObjectId: null,
-        showEditPanel: false,
-        changeMarkers: [...s.changeMarkers, newMarker],
-      }));
     },
-    [restartPolling, state]
+    [state]
   );
+
+  const confirmEditPropagation = useCallback(() => {
+    const current = state;
+    const pending = current.pendingEdit;
+    if (!current.projectId || !pending || current.isEditPreviewing || current.isProcessing) return;
+
+    const startFrame = Number(pending.editRule.start_frame);
+    const endFrame = Number(pending.editRule.end_frame);
+    const { addLog } = useChangeLogStore.getState();
+    addLog(current.projectId, {
+      projectId: current.projectId,
+      type: "edit",
+      frameIndex: current.currentFrame,
+      data: {
+        editType: pending.action,
+        color: pending.params.color,
+        prompt: pending.params.prompt,
+        scale: pending.params.scale,
+        startFrame: startFrame - 1,
+        endFrame: endFrame - 1,
+      },
+    });
+
+    const markerId = `marker_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
+    const newMarker = {
+      id: markerId,
+      frame: current.currentFrame,
+      editType: pending.action,
+      timestamp: Date.now(),
+      params: { ...pending.params },
+    };
+
+    sweepMarkedRef.current = null;
+    fetch(`${API_URL}/edit`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project_id: current.projectId, edit_rules: [pending.editRule] }),
+    })
+      .then(async (res) => {
+        const data = await res.json();
+        if (!res.ok || data.error) {
+          throw new Error(data.error || `Edit request failed (${res.status})`);
+        }
+        if (pollingRef.current) clearInterval(pollingRef.current);
+        pollingRef.current = null;
+        restartPolling(500);
+      })
+      .catch((err) => {
+        setState((s) => ({
+          ...s,
+          isProcessing: false,
+          editStatus: "error",
+          showToast: true,
+          toastMessage: `Edit failed: ${err.message}`,
+        }));
+      });
+
+    setState((s) => ({
+      ...s,
+      pendingEdit: null,
+      isProcessing: true,
+      isPlaying: true,
+      editStatus: "editing",
+      editPhase: "applying",
+      editProgress: { done: 0, total: endFrame - startFrame + 1 },
+      changeMarkers: [...s.changeMarkers, newMarker],
+    }));
+  }, [restartPolling, state]);
+
+  const cancelEditPreview = useCallback(() => {
+    setState((s) => {
+      if (s.instantPreviewUrl) URL.revokeObjectURL(s.instantPreviewUrl);
+      return {
+        ...s,
+        pendingEdit: null,
+        isEditPreviewing: false,
+        instantPreviewUrl: null,
+        instantPreviewFrame: null,
+      };
+    });
+    if (state.projectId) {
+      fetch(`${API_URL}/edit/preview/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project_id: state.projectId }),
+      }).catch(() => {});
+    }
+  }, [state.projectId]);
 
   const handleMarkerDrag = useCallback((markerId: string, newFrame: number) => {
     const current = state;
@@ -1060,12 +1128,20 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
     setState((s) => {
       // Clear preview when changing frames (unless we're applying the edit)
       const shouldClearPreview = s.aiEditStatus === "preview" && s.currentFrame !== frame;
+      const shouldDiscardPendingEdit = s.pendingEdit !== null && s.currentFrame !== frame;
+      if (shouldDiscardPendingEdit && s.instantPreviewUrl) {
+        URL.revokeObjectURL(s.instantPreviewUrl);
+      }
       return {
         ...s,
         currentFrame: frame,
         // Clear preview when navigating away
         aiPreviewFrameUrl: shouldClearPreview ? null : s.aiPreviewFrameUrl,
         aiEditStatus: shouldClearPreview ? "idle" : s.aiEditStatus,
+        pendingEdit: shouldDiscardPendingEdit ? null : s.pendingEdit,
+        isEditPreviewing: shouldDiscardPendingEdit ? false : s.isEditPreviewing,
+        instantPreviewUrl: shouldDiscardPendingEdit ? null : s.instantPreviewUrl,
+        instantPreviewFrame: shouldDiscardPendingEdit ? null : s.instantPreviewFrame,
       };
     });
   }, []);
@@ -1162,6 +1238,8 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
     applyEdit,
     cancelEdit,
     applyEditAction,
+    confirmEditPropagation,
+    cancelEditPreview,
     undoEdit,
     setCurrentFrame,
     togglePlay,

@@ -28,6 +28,14 @@ class EditCancelled(RuntimeError):
     """Raised between frames when the user cancels an edit job."""
 
 
+def _update_status_safe(project_id: str, **updates) -> None:
+    """Progress telemetry must never make an otherwise valid edit fail."""
+    try:
+        project_manager.update_status(project_id, **updates)
+    except OSError:
+        pass
+
+
 def _project_dir(project_id: str) -> Path:
     return project_manager.get_project_dir(project_id)
 
@@ -35,13 +43,22 @@ def _project_dir(project_id: str) -> Path:
 def _ensure_flows(project_dir: Path, start: int, end: int):
     """RAFT flow on original footage — cached once per project, cheap on re-edit.
     Restricted to the pairs this edit can touch (range + inpaint donor margin)."""
-    with config.gpu_job(f"raft:{project_dir.name}"):
-        flow_service.compute_flows(
-            project_dir / "frames", project_dir / "flows",
-            device=config.get_device(),
-            start=max(1, start - INPAINT_MARGIN),
-            end=end + INPAINT_MARGIN,
-        )
+    project_id = project_dir.name
+    _update_status_safe(
+        project_id, flow_status="computing", edit_phase="optical_flow")
+    try:
+        with config.gpu_job(f"raft:{project_id}"):
+            flow_service.compute_flows(
+                project_dir / "frames", project_dir / "flows",
+                device=config.get_device(),
+                start=max(1, start - INPAINT_MARGIN),
+                end=end + INPAINT_MARGIN,
+            )
+        _update_status_safe(project_id, flow_status="done")
+    except Exception as exc:
+        _update_status_safe(
+            project_id, flow_status="error", flow_error=str(exc))
+        raise
 
 
 def _ensure_masks(project_id: str, project_dir: Path, start: int, end: int,
@@ -142,6 +159,7 @@ async def run_edit_rule(
     sweep = _Sweep(project_id, len(indices))
 
     if rule.edit_type in DETERMINISTIC:
+        _update_status_safe(project_id, edit_phase="applying")
         await asyncio.to_thread(
             _ensure_masks, project_id, project_dir, rule.start_frame, rule.end_frame,
             cancel_check)
@@ -156,6 +174,7 @@ async def run_edit_rule(
         # transports + generative need flow; resize-up occludes, needs none
         await asyncio.to_thread(
             _ensure_flows, project_dir, rule.start_frame, rule.end_frame)
+    _update_status_safe(project_id, edit_phase="propagating")
     await asyncio.to_thread(
         _ensure_masks, project_id, project_dir, rule.start_frame, rule.end_frame,
         cancel_check)
