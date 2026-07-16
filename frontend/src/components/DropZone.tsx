@@ -2,10 +2,12 @@
 
 import { useCallback, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Upload, Loader2 } from "lucide-react";
+import { AlertCircle, Clock3, Upload, Loader2 } from "lucide-react";
 import { useVideoStore } from "@/stores/videoStore";
-
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { uploadProjectVideo } from "@/lib/upload-project";
+import {
+  MAX_VIDEO_DURATION_SECONDS,
+} from "@/lib/video-upload";
 
 export function DropZone() {
   const router = useRouter();
@@ -18,34 +20,28 @@ export function DropZone() {
 
   async function uploadFile(file: File) {
     setUploading(true);
-    setStatus("Uploading video...");
+    setStatus("Checking video length...");
 
-    const formData = new FormData();
-    formData.append("file", file);
+    try {
+      const data = await uploadProjectVideo(file, setStatus);
 
-    const res = await fetch(`${API_URL}/upload`, { method: "POST", body: formData });
-    const data = await res.json();
+      // Keep guest history in this browser. Signed-in users additionally get a
+      // durable Supabase row that appears on every device in /dashboard.
+      addProject({
+        projectId: data.project_id,
+        videoName: file.name,
+        uploadedAt: Date.now(),
+        status: data.compute_available ? "processing" : "stored",
+        storagePath: data.storage_path,
+      });
+      setCurrentProject(data.project_id);
 
-    // Derive thumbnail from Cloudinary video URL (snapshot at 0s)
-    const thumbnailUrl = data.video_url
-      ? data.video_url
-        .replace("/video/upload/", "/video/upload/so_0,w_640/")
-        .replace(/\.(mp4|mov|webm|avi)$/i, ".jpg")
-      : null;
-
-    // Register project in Supabase (best-effort — don't block navigation on failure)
-    fetch("/api/projects", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        project_id: data.project_id,
-        name: file.name,
-        thumbnail_url: thumbnailUrl,
-      }),
-    }).catch(() => { });
-
-    // Redirect immediately — editor will kick off extract and poll for readiness
-    router.push(`/editor/${data.project_id}`);
+      // The editor shows the durable video while Modal warms its working cache.
+      router.push(`/editor/${data.project_id}`);
+    } catch (error) {
+      setUploading(false);
+      setStatus(error instanceof Error ? error.message : "Upload failed");
+    }
   }
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -64,6 +60,8 @@ export function DropZone() {
     const file = e.dataTransfer.files[0];
     if (file && file.type.startsWith("video/")) {
       uploadFile(file);
+    } else {
+      setStatus("Please choose a video file.");
     }
   }, []);
 
@@ -96,6 +94,10 @@ export function DropZone() {
           <p className="text-[var(--fg-muted)] text-lg mb-4">
             Drag and drop your video here
           </p>
+          <div className="mb-5 flex items-center justify-center gap-2 text-sm font-semibold text-[var(--accent)]">
+            <Clock3 className="h-4 w-4" />
+            Videos must be under {MAX_VIDEO_DURATION_SECONDS} seconds
+          </div>
           <p className="text-[var(--fg-subtle)] text-sm mb-6">or</p>
           <div className="flex items-center justify-center gap-3 flex-wrap">
             <button
@@ -105,13 +107,16 @@ export function DropZone() {
               <Upload className="w-4 h-4" />
               Upload from device
             </button>
-            <button
-              onClick={handleUploadClick}
-              className="inline-flex items-center gap-2 px-7 py-3 rounded-xl bg-[var(--accent)] text-white font-semibold transition-all duration-300 hover:bg-[var(--accent-hover)] hover:scale-[1.02] active:scale-[0.98] cursor-pointer"
-            >
-              Get Started
-            </button>
           </div>
+          {status && (
+            <p
+              role="alert"
+              className="mt-5 flex items-center justify-center gap-2 text-sm font-medium text-red-500"
+            >
+              <AlertCircle className="h-4 w-4 shrink-0" />
+              {status}
+            </p>
+          )}
         </>
       )}
       <input

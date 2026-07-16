@@ -1,10 +1,15 @@
+import os
 import uuid
 import json
 import threading
 import tempfile
+import re
 from pathlib import Path
 
-BASE_DIR = Path(tempfile.gettempdir()) / "frameshift"
+# On Modal this points at the mounted Volume (system of record, Doc 1 §9);
+# locally it falls back to the OS temp dir.
+BASE_DIR = Path(os.getenv("FRAMESHIFT_PROJECTS_DIR")
+                or Path(tempfile.gettempdir()) / "frameshift")
 
 _locks: dict[str, threading.Lock] = {}
 _locks_lock = threading.Lock()
@@ -16,8 +21,15 @@ def _get_lock(project_id: str) -> threading.Lock:
         return _locks[project_id]
 
 
-def create_project() -> dict:
-    project_id = str(uuid.uuid4())[:8]
+_PROJECT_ID = re.compile(r"^[a-f0-9]{32}$")
+
+
+def create_project(project_id: str | None = None) -> dict:
+    # The ID is also the guest project's bearer capability in public editor
+    # URLs, so retain the full 128 bits instead of the old 8-character prefix.
+    project_id = project_id or uuid.uuid4().hex
+    if not _PROJECT_ID.fullmatch(project_id):
+        raise ValueError("project_id must be a 32-character hexadecimal id")
     project_dir = BASE_DIR / project_id
     project_dir.mkdir(parents=True, exist_ok=True)
     (project_dir / "frames").mkdir(exist_ok=True)
@@ -25,18 +37,19 @@ def create_project() -> dict:
     (project_dir / "edited").mkdir(exist_ok=True)
     (project_dir / "backups").mkdir(exist_ok=True)
 
-    _write_status(project_id, {
-        "status": "created",
-        "frame_count": 0,
-        "detections": {},
-        "edit_status": "idle",
-        "edit_progress": {"done": 0, "total": 0},
-        "ai_generation_id": None,
-        "ai_preview_url": None,
-        "ai_prompt": None,
-        "ai_edit_status": None,
-        "ai_edit_progress": None,
-    })
+    if not _status_path(project_id).exists():
+        _write_status(project_id, {
+            "status": "created",
+            "frame_count": 0,
+            "detections": {},
+            "edit_status": "idle",
+            "edit_progress": {"done": 0, "total": 0},
+            "ai_generation_id": None,
+            "ai_preview_url": None,
+            "ai_prompt": None,
+            "ai_edit_status": None,
+            "ai_edit_progress": None,
+        })
 
     return {"project_id": project_id, "project_dir": str(project_dir)}
 
@@ -46,7 +59,8 @@ def reset_stuck_projects():
         return
     stuck_fields = {
         "ai_edit_status": (["processing"], "idle"),
-        "edit_status": (["uploading", "editing"], "idle"),
+        "edit_status": (["uploading", "editing", "processing"], "idle"),
+        "segment_status": (["segmenting", "propagating"], "error"),
         "refine_status": (["processing"], "idle"),
     }
     reset_values = {
@@ -54,6 +68,8 @@ def reset_stuck_projects():
         "ai_edit_progress": {"done": 0, "total": 0},
         "ai_interpolation_progress": {"done": 0, "total": 0},
         "edit_progress": {"done": 0, "total": 0},
+        "edit_phase": None,
+        "segment_error": "Operation interrupted by server restart.",
         "detecting": False,
         "segmenting": False,
     }

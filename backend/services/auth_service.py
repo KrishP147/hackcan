@@ -6,32 +6,50 @@ from jose import jwt, JWTError
 from fastapi import HTTPException, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN", "")
-AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE", "")
-
 _jwks_cache: dict = {}
 _jwks_fetched_at: float = 0
+_jwks_domain: str = ""
 _JWKS_TTL = 3600  # Re-fetch keys every hour
 
 security = HTTPBearer(auto_error=False)
 
 
+def _domain() -> str:
+    return os.getenv("AUTH0_DOMAIN", "").removeprefix("https://").rstrip("/")
+
+
+def _audience() -> str:
+    return os.getenv("AUTH0_AUDIENCE", "")
+
+
+def is_auth0_configured() -> bool:
+    return bool(_domain() and _audience())
+
+
 def _get_jwks() -> dict:
-    global _jwks_cache, _jwks_fetched_at
+    global _jwks_cache, _jwks_fetched_at, _jwks_domain
+    domain = _domain()
+    if not domain:
+        raise HTTPException(status_code=503, detail="Auth0 domain is not configured")
     now = time.time()
-    if _jwks_cache and (now - _jwks_fetched_at) < _JWKS_TTL:
+    if (_jwks_cache and _jwks_domain == domain
+            and (now - _jwks_fetched_at) < _JWKS_TTL):
         return _jwks_cache
-    url = f"https://{AUTH0_DOMAIN}/.well-known/jwks.json"
+    url = f"https://{domain}/.well-known/jwks.json"
     resp = httpx.get(url, timeout=10)
     resp.raise_for_status()
     _jwks_cache = resp.json()
     _jwks_fetched_at = now
+    _jwks_domain = domain
     return _jwks_cache
 
 
 def verify_token(token: str) -> dict:
     """Validate an Auth0 JWT. Returns the decoded payload."""
+    if not is_auth0_configured():
+        raise HTTPException(status_code=503, detail="Auth0 API validation is not configured")
     try:
+        domain = _domain()
         jwks = _get_jwks()
         unverified_header = jwt.get_unverified_header(token)
         rsa_key = {}
@@ -51,8 +69,8 @@ def verify_token(token: str) -> dict:
             token,
             rsa_key,
             algorithms=["RS256"],
-            audience=AUTH0_AUDIENCE,
-            issuer=f"https://{AUTH0_DOMAIN}/",
+            audience=_audience(),
+            issuer=f"https://{domain}/",
         )
         return payload
     except JWTError as e:

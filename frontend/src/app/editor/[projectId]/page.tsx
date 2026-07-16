@@ -4,14 +4,12 @@ import { EditorTopBar } from "@/components/editor/EditorTopBar";
 import { EditorCanvas } from "@/components/editor/EditorCanvas";
 import { EditorTimeline } from "@/components/editor/EditorTimeline";
 import { EditToolbar } from "@/components/editor/EditToolbar";
-import { AIChatPane } from "@/components/editor/AIChatPane";
 import { Toast } from "@/components/editor/Toast";
-import { AIProgressOverlay } from "@/components/editor/AIProgressOverlay";
 import { EditProgressOverlay } from "@/components/editor/EditProgressOverlay";
 import { ExportProgressOverlay } from "@/components/editor/ExportProgressOverlay";
 import { useEditorState } from "@/hooks/useEditorState";
 import { useProjectSync } from "@/hooks/useProjectSync";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, useSearchParams } from "next/navigation";
 import { useVideoStore } from "@/stores/videoStore";
 
@@ -21,15 +19,78 @@ export default function EditorPage() {
   const projectId = params.projectId as string;
   const initialFrame = Number(searchParams.get("frame") ?? 0);
   const setCurrentProject = useVideoStore((state) => state.setCurrentProject);
+  const addProject = useVideoStore((state) => state.addProject);
+  const locallyStored = useVideoStore((state) =>
+    Boolean(state.projects.find((project) => project.projectId === projectId)?.storagePath)
+  );
   const editor = useEditorState(projectId, initialFrame);
+  const [hasStoredVideo, setHasStoredVideo] = useState(locallyStored);
+  const [editorFrameReady, setEditorFrameReady] = useState(false);
+
+  useEffect(() => {
+    if (locallyStored) setHasStoredVideo(true);
+  }, [locallyStored]);
+
+  useEffect(() => {
+    if (!projectId || hasStoredVideo) return;
+    void fetch(`/api/projects/${projectId}/media?kind=current`, { method: "HEAD" })
+      .then((response) => {
+        if (response.ok) setHasStoredVideo(true);
+      })
+      .catch(() => {});
+  }, [hasStoredVideo, projectId]);
 
   useProjectSync({
     projectId,
     currentFrame: editor.currentFrame,
     videoLoaded: editor.videoLoaded,
-    status: editor.videoLoaded ? "ready" : "created",
-    thumbnailUrl: editor.storageBaseUrl ? `${editor.storageBaseUrl}/frame_0001.jpg` : null,
+    status: editor.videoLoaded ? "ready" : "",
+    thumbnailUrl: null,
+    name: editor.videoName,
   });
+
+  // Hydrate account metadata before the polling fallback can permanently use
+  // the raw project id as a title. This also restores the saved playhead when
+  // an editor URL is opened directly instead of through the dashboard card.
+  useEffect(() => {
+    if (!projectId) return;
+    let active = true;
+
+    void fetch(`/api/projects/${projectId}`).then(async (response) => {
+      if (!response.ok || !active) return;
+      const project = await response.json();
+      if (!active) return;
+
+      const projectName = typeof project.name === "string" && project.name.trim()
+        ? project.name
+        : "Untitled Project";
+      editor.setVideoName(projectName);
+      setHasStoredVideo(
+        Boolean(project.original_path) || ["stored", "processing"].includes(project.status)
+      );
+      addProject({
+        projectId,
+        videoName: projectName,
+        uploadedAt: Date.parse(project.created_at) || Date.now(),
+        status: project.status,
+      });
+
+      if (!searchParams.has("frame") && Number.isInteger(project.last_frame)) {
+        editor.setCurrentFrame(Math.max(0, project.last_frame));
+      }
+    }).catch(() => {});
+
+    return () => {
+      active = false;
+    };
+  }, [addProject, editor.setCurrentFrame, editor.setVideoName, projectId, searchParams]);
+
+  // Recreate Modal's disposable cache from durable Supabase media. Failure is
+  // non-fatal: the stored video remains playable below.
+  useEffect(() => {
+    if (!projectId) return;
+    void fetch(`/api/projects/${projectId}/resume`, { method: "POST" }).catch(() => {});
+  }, [projectId]);
 
   // Set current project in Zustand when page loads
   useEffect(() => {
@@ -38,28 +99,42 @@ export default function EditorPage() {
     }
   }, [projectId, setCurrentProject]);
   const playIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const rafRef = useRef<number | null>(null);
-  const lastFrameTimeRef = useRef<number>(0);
   const currentFrameRef = useRef(editor.currentFrame);
   const framesLengthRef = useRef(editor.frames.length);
   const [isDark, setIsDark] = useState(false);
 
-  // Playback loop — 15 fps so frames have time to load
+  // Frame-by-frame fallback for projects that do not yet have a durable MP4.
+  // Stored projects use the browser's native video decoder in EditorCanvas.
   const playbackFps = 15;
   useEffect(() => {
-    if (editor.isPlaying && editor.videoLoaded) {
+    currentFrameRef.current = editor.currentFrame;
+  }, [editor.currentFrame]);
+
+  useEffect(() => {
+    framesLengthRef.current = editor.frames.length;
+  }, [editor.frames.length]);
+
+  useEffect(() => {
+    if (editor.isPlaying && editor.videoLoaded && !hasStoredVideo) {
       playIntervalRef.current = setInterval(() => {
-        editor.setCurrentFrame(
-          editor.currentFrame >= editor.frames.length - 1
-            ? 0
-            : editor.currentFrame + 1
-        );
+        const frameCount = framesLengthRef.current;
+        if (frameCount <= 0) return;
+        const nextFrame = currentFrameRef.current >= frameCount - 1
+          ? 0
+          : currentFrameRef.current + 1;
+        currentFrameRef.current = nextFrame;
+        editor.setCurrentFrame(nextFrame);
       }, 1000 / playbackFps);
     }
     return () => {
       if (playIntervalRef.current) clearInterval(playIntervalRef.current);
     };
-  }, [editor.isPlaying, editor.videoLoaded, editor.currentFrame, editor.frames.length, editor.setCurrentFrame]);
+  }, [editor.isPlaying, editor.videoLoaded, editor.setCurrentFrame, hasStoredVideo]);
+
+  const handlePlaybackEnded = useCallback(() => {
+    editor.setCurrentFrame(0);
+    if (editor.isPlaying) editor.togglePlay();
+  }, [editor.isPlaying, editor.setCurrentFrame, editor.togglePlay]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -111,6 +186,8 @@ export default function EditorPage() {
           detections={editor.detections}
           isDetecting={editor.isDetecting}
           isSegmenting={editor.isSegmenting}
+          segmentStatus={editor.segmentStatus}
+          segmentAnchorFrame={editor.segmentAnchorFrame}
           maskCount={editor.maskCount}
           maskVersion={editor.maskVersion}
           editVersion={editor.editVersion}
@@ -122,15 +199,30 @@ export default function EditorPage() {
           zoom={editor.zoom}
           currentFrame={editor.currentFrame}
           totalFrames={editor.frames.length}
+          fps={editor.fps}
+          isPlaying={editor.isPlaying}
           frameWidth={editor.frameWidth}
           frameHeight={editor.frameHeight}
           previewFrameUrl={editor.aiPreviewFrameUrl}
+          instantPreviewUrl={editor.instantPreviewUrl}
+          instantPreviewFrame={editor.instantPreviewFrame}
+          pendingEditAction={editor.pendingEdit?.action ?? null}
+          isEditPreviewing={editor.isEditPreviewing}
           aiEditStatus={editor.aiEditStatus}
           storageBaseUrl={editor.storageBaseUrl}
+          storedVideoUrl={hasStoredVideo
+            ? `/api/projects/${projectId}/media?kind=current`
+            : null}
+          onFrameReadyChange={setEditorFrameReady}
+          onPlaybackFrame={editor.setCurrentFrame}
+          onPlaybackEnded={handlePlaybackEnded}
           onSelectObject={editor.selectObject}
           onUpload={editor.loadVideo}
           onApplyEdit={editor.applyEditAction}
           onSegmentAtPoint={editor.segmentAtPoint}
+          onConfirmPropagation={editor.confirmSegmentPropagation}
+          onConfirmEditPropagation={editor.confirmEditPropagation}
+          onCancelEditPreview={editor.cancelEditPreview}
           onCancelEdit={editor.cancelEdit}
         />
 
@@ -140,29 +232,14 @@ export default function EditorPage() {
               ? editor.detections.find((d) => d.id === editor.selectedObjectId)?.label || "object"
               : "selection"
           }
-          active={!editor.isSegmenting && editor.videoLoaded}
+          active={editorFrameReady && !editor.isPlaying && !editor.isSegmenting && !editor.isProcessing && !editor.isEditPreviewing && !editor.pendingEdit && editor.videoLoaded && editor.segmentStatus !== "keyframe_ready"}
           hasMask={editor.maskCount > 0}
           editApplied={editor.editVersion > 0}
+          isPreviewing={editor.isEditPreviewing}
+          pendingAction={editor.pendingEdit?.action ?? null}
           onApply={editor.applyEditAction}
-          onRefine={editor.refineFrame}
-          onPropagate={editor.propagateEdit}
           onUndo={editor.undoEdit}
           onClose={editor.closeEditPanel}
-          isRefining={editor.isRefining}
-        />
-
-        <AIChatPane
-          projectId={projectId}
-          currentFrame={editor.currentFrame}
-          videoLoaded={editor.videoLoaded}
-          chatHistory={editor.aiChatHistory}
-          previewFrameUrl={editor.aiPreviewFrameUrl}
-          isGenerating={editor.isAIGenerating}
-          aiEditStatus={editor.aiEditStatus}
-          onSendPrompt={editor.sendAIPrompt}
-          onAccept={editor.acceptAIGeneration}
-          onReject={editor.rejectAIGeneration}
-          onRetry={editor.retryAIGeneration}
         />
       </div>
 
@@ -191,19 +268,11 @@ export default function EditorPage() {
         onHide={editor.hideToast}
       />
 
-      <AIProgressOverlay
-        show={editor.aiEditStatus === "applying"}
-        progress={editor.aiEditProgress}
-        interpolationProgress={editor.aiInterpolationProgress}
-        phase={editor.aiEditPhase}
-        status={editor.aiEditStatus}
-        onCancel={editor.cancelEdit}
-      />
-
       <EditProgressOverlay
-        show={editor.isProcessing && (editor.editStatus === "uploading" || editor.editStatus === "editing")}
+        show={editor.isProcessing}
         progress={editor.editProgress}
         status={editor.editStatus}
+        phase={editor.editPhase}
       />
 
       <ExportProgressOverlay

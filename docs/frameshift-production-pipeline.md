@@ -284,7 +284,7 @@ Storage: `projects/{id}/frames/frame_%04d.jpg`, `masks/mask_%04d.png` (0/255), `
 - Modal: FastAPI as `@modal.asgi_app()`. Image: `debian-slim` + torch/torchvision `cu121` + sam2 + opencv-headless + ffmpeg (+ matting/inpaint weights if used). **No custom native build on this path** — RAFT ships pre-compiled; Doc 2's kernel is optional and off this path.
 - SAM 2 + RAFT (+ matting/inpaint) in `@modal.enter()` with memory snapshots → warm cold starts.
 - GPU: A10G for production (headroom for RAFT + SAM 2 + matting + inpaint per clip); T4 if profiling allows.
-- `modal.Volume` at projects dir; path-based `project_manager` unchanged. Secrets: Gemini + Cloudinary. CORS pinned to Vercel. Per-IP token-bucket rate limit. Auth0 on.
+- `modal.Volume` at projects dir; path-based `project_manager` unchanged. The volume is the system of record for source videos, frames, masks, edits, and rendered output. Secrets: Gemini only when generative edits are enabled. CORS pinned to Vercel. Per-IP token-bucket rate limit. Auth0 on.
 - Vercel: frontend as-is; `NEXT_PUBLIC_API_URL` → Modal.
 
 ---

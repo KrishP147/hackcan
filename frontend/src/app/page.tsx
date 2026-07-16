@@ -6,6 +6,7 @@ import { HowItWorks } from "@/components/HowItWorks";
 import { Footer } from "@/components/Footer";
 import { StickyCTA } from "@/components/StickyCTA";
 import { VideoHistory } from "@/components/VideoHistory";
+import { DemoVideo } from "@/components/DemoVideo";
 
 export default function Home() {
   return (
@@ -13,6 +14,7 @@ export default function Home() {
       <TopBar />
       <Hero />
       <VideoHistory />
+      <DemoVideo />
       <BentoGrid />
       <FeatureCarousel />
       <HowItWorks />

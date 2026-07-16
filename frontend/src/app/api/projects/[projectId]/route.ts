@@ -1,11 +1,38 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth0 } from "@/lib/auth0";
 import { supabaseAdmin } from "@/lib/supabase";
+import { removeProjectObjects } from "@/lib/project-storage";
+
+export async function GET(
+  _req: NextRequest,
+  { params }: { params: Promise<{ projectId: string }> }
+) {
+  if (!supabaseAdmin) {
+    return NextResponse.json({ error: "Project sync is not configured" }, { status: 503 });
+  }
+  const session = await auth0.getSession();
+  if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+  const { projectId } = await params;
+  const { data, error } = await supabaseAdmin
+    .from("projects")
+    .select("*")
+    .eq("project_id", projectId)
+    .eq("user_id", session.user.sub)
+    .maybeSingle();
+
+  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (!data) return NextResponse.json({ error: "Project not found" }, { status: 404 });
+  return NextResponse.json(data);
+}
 
 export async function PATCH(
   req: NextRequest,
   { params }: { params: Promise<{ projectId: string }> }
 ) {
+  if (!supabaseAdmin) {
+    return NextResponse.json({ error: "Project sync is not configured" }, { status: 503 });
+  }
   const session = await auth0.getSession();
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
@@ -13,7 +40,11 @@ export async function PATCH(
   const body = await req.json();
 
   // Only allow updating these fields
-  const allowed = ["last_frame", "status", "name", "thumbnail_url"];
+  const allowed = [
+    "last_frame", "status", "name", "thumbnail_url", "thumbnail_path",
+    "current_path", "checkpoint_path", "export_path", "storage_status",
+    "frame_count", "edit_version",
+  ];
   const updates: Record<string, unknown> = {};
   for (const key of allowed) {
     if (key in body) updates[key] = body[key];
@@ -35,17 +66,23 @@ export async function DELETE(
   _req: NextRequest,
   { params }: { params: Promise<{ projectId: string }> }
 ) {
+  if (!supabaseAdmin) {
+    return NextResponse.json({ error: "Project sync is not configured" }, { status: 503 });
+  }
   const session = await auth0.getSession();
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   const { projectId } = await params;
-
-  const { error } = await supabaseAdmin
+  const { data, error } = await supabaseAdmin
     .from("projects")
     .delete()
     .eq("project_id", projectId)
-    .eq("user_id", session.user.sub);
+    .eq("user_id", session.user.sub)
+    .select("project_id")
+    .maybeSingle();
 
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (!data) return NextResponse.json({ error: "Project not found" }, { status: 404 });
+  await removeProjectObjects(projectId);
   return NextResponse.json({ success: true });
 }

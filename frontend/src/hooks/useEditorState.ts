@@ -8,14 +8,20 @@ import {
   type FrameData,
   generateFrames,
 } from "@/lib/mock-data";
-import type { ChatMessage } from "@/components/editor/AIChatPane";
 import { useVideoStore } from "@/stores/videoStore";
 import { useChangeLogStore } from "@/stores/changeLogStore";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const SEGMENTING_STATUSES = new Set(["segmenting", "propagating"]);
 
 interface PerFrameDetections {
   [frameKey: string]: { label: string; confidence: number; bbox: [number, number, number, number] }[];
+}
+
+interface PendingEdit {
+  action: string;
+  params: { color?: string; prompt?: string; scale?: number; dx?: number; dy?: number };
+  editRule: Record<string, unknown>;
 }
 
 interface EditorState {
@@ -33,6 +39,8 @@ interface EditorState {
   detections: Detection[];
   isDetecting: boolean;
   isSegmenting: boolean;
+  segmentStatus: string | null;
+  segmentAnchorFrame: number | null;
   maskCount: number;
   maskVersion: number;
   editVersion: number;
@@ -43,6 +51,7 @@ interface EditorState {
   isProcessing: boolean;
   editProgress: { done: number; total: number };
   editStatus: "uploading" | "editing" | "done" | "error" | null;
+  editPhase: string | null;
   applyToAllFrames: boolean;
   editRangeStart: number;
   editRangeEnd: number;
@@ -50,7 +59,6 @@ interface EditorState {
   showEditPanel: boolean;
   toastMessage: string;
   showToast: boolean;
-  aiChatHistory: ChatMessage[];
   aiPreviewFrameUrl: string | null;
   aiGenerationId: string | null;
   isAIGenerating: boolean;
@@ -60,9 +68,26 @@ interface EditorState {
   aiEditPhase: "transforming" | "interpolating" | "done" | null;
   aiInterpolationProgress: { done: number; total: number };
   isRefining: boolean;
-  changeMarkers: Array<{ id: string; frame: number; editType: string; timestamp: number }>;
+  changeMarkers: Array<{
+    id: string;
+    frame: number;
+    editType: string;
+    timestamp: number;
+    params?: { color?: string; prompt?: string; scale?: number; dx?: number; dy?: number };
+  }>;
   isExporting: boolean;
+  instantPreviewUrl: string | null;    // blob URL of the single-frame preview
+  instantPreviewFrame: number | null;  // 0-based frame it belongs to
+  pendingEdit: PendingEdit | null;
+  isEditPreviewing: boolean;
 }
+
+// Every edit previews one keyframe before propagation. Replace and bg_replace
+// are slower because they generate that keyframe once with Gemini.
+const PREVIEWABLE_ACTIONS = new Set([
+  "recolor", "blur_region", "color_pop", "glow", "resize", "delete", "move",
+  "replace", "bg_replace",
+]);
 
 const DEFAULT_EDIT_PARAMS: EditParams = {
   recolor: { color: "#F43F5E", opacity: 0.6 },
@@ -88,6 +113,8 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
     detections: [],
     isDetecting: false,
     isSegmenting: false,
+    segmentStatus: null,
+    segmentAnchorFrame: null,
     maskCount: 0,
     maskVersion: 0,
     editVersion: 0,
@@ -97,6 +124,7 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
     isProcessing: false,
     editProgress: { done: 0, total: 0 },
     editStatus: null,
+    editPhase: null,
     applyToAllFrames: true,
     editRangeStart: 0,
     editRangeEnd: 0,
@@ -104,7 +132,6 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
     showEditPanel: false,
     toastMessage: "",
     showToast: false,
-    aiChatHistory: [],
     aiPreviewFrameUrl: null,
     aiGenerationId: null,
     isAIGenerating: false,
@@ -116,10 +143,46 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
     isRefining: false,
     changeMarkers: [],
     isExporting: false,
+    instantPreviewUrl: null,
+    instantPreviewFrame: null,
+    pendingEdit: null,
+    isEditPreviewing: false,
   });
 
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const acceptInProgressRef = useRef<boolean>(false);
+  // Range of frames already marked refreshed during the current edit sweep
+  const sweepMarkedRef = useRef<{ lo: number; hi: number } | null>(null);
+
+  // Reads edit_sweep {lo,hi,done,total} (1-based frames) from status and bumps
+  // per-frame versions for newly propagated frames, so the edit visibly spreads
+  // across the clip while the background pass runs. Drops the instant preview
+  // once real propagated pixels for its frame have landed.
+  const handleEditSweep = useCallback((status: { edit_sweep?: { lo: number; hi: number; done: number; total: number } | null }) => {
+    const sweep = status.edit_sweep;
+    if (!sweep || typeof sweep.lo !== "number" || typeof sweep.hi !== "number") return;
+    setState((s) => {
+      const prev = sweepMarkedRef.current;
+      const newlyDone: number[] = [];
+      for (let f = sweep.lo; f <= sweep.hi; f++) {
+        if (!prev || f < prev.lo || f > prev.hi) newlyDone.push(f);
+      }
+      sweepMarkedRef.current = { lo: sweep.lo, hi: sweep.hi };
+      if (newlyDone.length === 0) return s;
+      const versions = { ...(s.transformedFrameVersions || {}) };
+      for (const f of newlyDone) versions[f] = (versions[f] || 0) + 1;
+      const previewFrame1 = s.instantPreviewFrame !== null ? s.instantPreviewFrame + 1 : null;
+      const previewSwept = previewFrame1 !== null && previewFrame1 >= sweep.lo && previewFrame1 <= sweep.hi;
+      if (previewSwept && s.instantPreviewUrl) URL.revokeObjectURL(s.instantPreviewUrl);
+      return {
+        ...s,
+        transformedFrameVersions: versions,
+        editProgress: sweep.total > 0 ? { done: sweep.done, total: sweep.total } : s.editProgress,
+        instantPreviewUrl: previewSwept ? null : s.instantPreviewUrl,
+        instantPreviewFrame: previewSwept ? null : s.instantPreviewFrame,
+      };
+    });
+  }, []);
 
   // Unified polling for project status - single interval, handles all status updates
   useEffect(() => {
@@ -168,9 +231,10 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
           : (hasMasksImmediate ? "done" : undefined);
 
         if (segmentStatusImmediate !== undefined) {
-          const segmentingStatus = segmentStatusImmediate === "segmenting";
-          const segmentError = status.segment_error;
+          const segmentingStatus = SEGMENTING_STATUSES.has(segmentStatusImmediate);
+          const segmentError = segmentStatusImmediate === "error" ? status.segment_error : null;
           const isDone = segmentStatusImmediate === "done";
+          const isKeyframeReady = segmentStatusImmediate === "keyframe_ready";
 
           console.log("[Frontend] Immediate segmentation status update:", {
             segment_status: segmentStatusImmediate,
@@ -185,7 +249,11 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
               ? status.mask_count
               : s.maskCount;
             // Increment maskVersion when done to force refresh
-            const shouldIncrementMaskVersion = isDone && (newMaskCount > s.maskCount || s.maskVersion === 0);
+            const shouldIncrementMaskVersion = (isDone || isKeyframeReady) && (
+              newMaskCount > s.maskCount ||
+              s.maskVersion === 0 ||
+              s.segmentStatus !== segmentStatusImmediate
+            );
 
             console.log("[Frontend] Updating segmentation state (immediate):", {
               oldMaskCount: s.maskCount,
@@ -199,6 +267,8 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
             return {
               ...s,
               isSegmenting: segmentingStatus,
+              segmentStatus: segmentStatusImmediate,
+              segmentAnchorFrame: status.anchor_frame ?? s.segmentAnchorFrame,
               maskCount: newMaskCount,
               maskVersion: shouldIncrementMaskVersion ? s.maskVersion + 1 : s.maskVersion,
               showToast: segmentError ? true : s.showToast,
@@ -268,7 +338,9 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
               editRangeEnd: s.editRangeEnd === 0 ? frameCount - 1 : s.editRangeEnd,
               isDetecting: !!status.detecting,
               // Use segmentStatus to determine isSegmenting - only true if actively segmenting
-              isSegmenting: segmentStatus === "segmenting",
+              isSegmenting: SEGMENTING_STATUSES.has(segmentStatus || ""),
+              segmentStatus: segmentStatus ?? s.segmentStatus,
+              segmentAnchorFrame: status.anchor_frame ?? s.segmentAnchorFrame,
               maskCount: maskCountFromStatus,
               storageBaseUrl: status.storage_base_url || s.storageBaseUrl,
             }));
@@ -281,9 +353,10 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
             // Update segmentation status and handle errors (this runs after the initial state update)
             // Use the segmentStatus already calculated above
             if (segmentStatus !== undefined) {
-              const segmentingStatus = segmentStatus === "segmenting";
-              const segmentError = status.segment_error;
+            const segmentingStatus = SEGMENTING_STATUSES.has(segmentStatus);
+              const segmentError = segmentStatus === "error" ? status.segment_error : null;
               const isDone = segmentStatus === "done";
+              const isKeyframeReady = segmentStatus === "keyframe_ready";
 
               console.log("[Frontend] Segmentation status update:", {
                 segment_status: segmentStatus,
@@ -299,7 +372,11 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
                   : s.maskCount;
                 // Increment maskVersion when segmentation completes to force mask refresh
                 // Also increment on page reload if masks exist to ensure display refreshes
-                const shouldIncrementMaskVersion = isDone && (newMaskCount > s.maskCount || s.maskVersion === 0);
+                const shouldIncrementMaskVersion = (isDone || isKeyframeReady) && (
+                  newMaskCount > s.maskCount ||
+                  s.maskVersion === 0 ||
+                  s.segmentStatus !== segmentStatus
+                );
 
                 console.log("[Frontend] Updating segmentation state:", {
                   oldMaskCount: s.maskCount,
@@ -312,6 +389,8 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
                 return {
                   ...s,
                   isSegmenting: segmentingStatus,
+                  segmentStatus,
+                  segmentAnchorFrame: status.anchor_frame ?? s.segmentAnchorFrame,
                   maskCount: newMaskCount,
                   maskVersion: shouldIncrementMaskVersion ? s.maskVersion + 1 : s.maskVersion,
                   showToast: segmentError ? true : s.showToast,
@@ -320,22 +399,38 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
               });
             }
 
-            // Update edit status (Cloudinary edits like recolor, remove, replace, etc.)
+            // Per-frame propagation sweep — refresh frames as the edit spreads
+            handleEditSweep(status);
+
+            // Update local frame-edit status (recolor, remove, replace, etc.)
             if (status.edit_status !== undefined) {
               const editDone = status.edit_status === "done";
               const editError = status.edit_status === "error";
               const editCancelled = status.edit_status === "cancelled";
+              const editProcessing = ["uploading", "editing", "processing"].includes(status.edit_status);
               const editProgress = status.edit_progress || { done: 0, total: 0 };
+              const backendEditVersion = Number(status.edit_version || 0);
 
               setState((s) => {
                 // Only update if still processing — prevents repeated editVersion increments
-                if (!s.isProcessing && (editDone || editError || editCancelled)) return s;
+                const finished = editDone || editError || editCancelled;
+                if (!s.isProcessing && finished && backendEditVersion <= s.editVersion) return s;
+                if (finished && s.instantPreviewUrl) URL.revokeObjectURL(s.instantPreviewUrl);
                 return {
                   ...s,
-                  isProcessing: !(editDone || editError || editCancelled),
+                  isProcessing: editProcessing,
                   editProgress: editProgress,
-                  editStatus: status.edit_status as "uploading" | "editing" | "done" | "error" | null,
-                  editVersion: (editDone && s.isProcessing) ? s.editVersion + 1 : s.editVersion,
+                  editStatus: editProcessing
+                    ? status.edit_status === "processing" ? "editing" : status.edit_status as "uploading" | "editing"
+                    : editDone ? "done" : editError ? "error" : null,
+                  editPhase: status.edit_phase ?? s.editPhase,
+                  editVersion: Math.max(
+                    s.editVersion,
+                    backendEditVersion,
+                    editDone && s.isProcessing ? s.editVersion + 1 : s.editVersion,
+                  ),
+                  instantPreviewUrl: finished ? null : s.instantPreviewUrl,
+                  instantPreviewFrame: finished ? null : s.instantPreviewFrame,
                   showToast: (editDone || editError) && s.isProcessing ? true : s.showToast,
                   toastMessage: editDone && s.isProcessing
                     ? "Edit applied successfully"
@@ -414,6 +509,8 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
               !status.segmenting &&
               status.edit_status !== "uploading" &&
               status.edit_status !== "editing" &&
+              status.edit_status !== "processing" &&
+              status.segment_status !== "propagating" &&
               status.refine_status !== "processing" &&
               status.ai_edit_status !== "processing" &&
               status.ai_edit_status !== "applying";
@@ -450,7 +547,7 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
         pollingRef.current = null;
       }
     };
-  }, [projectId]);
+  }, [projectId, handleEditSweep]);
 
   // Update displayed detections when frame changes
   useEffect(() => {
@@ -476,12 +573,15 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
     // They run automatically during /extract
   }, [state.projectId]);
 
-  const restartPolling = useCallback(() => {
+  const restartPolling = useCallback((intervalMs: number = 1500) => {
     if (!pollingRef.current && projectId) {
       const poll = async () => {
         try {
           const res = await fetch(`${API_URL}/project/${projectId}/status`);
           const status = await res.json();
+
+          // Per-frame propagation sweep — refresh frames as the edit spreads
+          handleEditSweep(status);
 
           // Handle segmentation status
           const hasMasks = (status.mask_count !== undefined && status.mask_count !== null && status.mask_count > 0);
@@ -491,32 +591,57 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
 
           if (segStatus !== undefined) {
             const isDone = segStatus === "done";
+            const isKeyframeReady = segStatus === "keyframe_ready";
             setState((s) => {
               const newMaskCount = status.mask_count !== undefined && status.mask_count !== null
                 ? status.mask_count : s.maskCount;
-              const shouldIncrementMaskVersion = isDone && (newMaskCount > s.maskCount || s.maskVersion === 0);
+              const shouldIncrementMaskVersion = (isDone || isKeyframeReady) && (
+                newMaskCount > s.maskCount ||
+                s.maskVersion === 0 ||
+                s.segmentStatus !== segStatus
+              );
               return {
                 ...s,
-                isSegmenting: segStatus === "segmenting",
+                isSegmenting: SEGMENTING_STATUSES.has(segStatus),
+                segmentStatus: segStatus,
+                segmentAnchorFrame: status.anchor_frame ?? s.segmentAnchorFrame,
                 maskCount: newMaskCount,
                 maskVersion: shouldIncrementMaskVersion ? s.maskVersion + 1 : s.maskVersion,
-                showToast: status.segment_error ? true : s.showToast,
-                toastMessage: status.segment_error ? `Segmentation failed: ${status.segment_error}` : s.toastMessage,
+                showToast: status.segment_status === "error" ? true : s.showToast,
+                toastMessage: status.segment_status === "error"
+                  ? `Segmentation failed: ${status.segment_error}`
+                  : s.toastMessage,
               };
             });
           }
 
-          // Handle edit status (Cloudinary edits)
+          // Handle local frame-edit status
           if (status.edit_status !== undefined) {
             const editDone = status.edit_status === "done";
             const editError = status.edit_status === "error";
             const editCancelled = status.edit_status === "cancelled";
+            const editProcessing = ["uploading", "editing", "processing"].includes(status.edit_status);
+            const editProgress = status.edit_progress || { done: 0, total: 0 };
+            const backendEditVersion = Number(status.edit_version || 0);
             setState((s) => {
-              if (!s.isProcessing && (editDone || editError || editCancelled)) return s;
+              const finished = editDone || editError || editCancelled;
+              if (!s.isProcessing && finished && backendEditVersion <= s.editVersion) return s;
+              if (finished && s.instantPreviewUrl) URL.revokeObjectURL(s.instantPreviewUrl);
               return {
                 ...s,
-                isProcessing: !(editDone || editError || editCancelled),
-                editVersion: (editDone && s.isProcessing) ? s.editVersion + 1 : s.editVersion,
+                isProcessing: editProcessing,
+                editProgress,
+                editStatus: editProcessing
+                  ? status.edit_status === "processing" ? "editing" : status.edit_status as "uploading" | "editing"
+                  : editDone ? "done" : editError ? "error" : null,
+                editPhase: status.edit_phase ?? s.editPhase,
+                editVersion: Math.max(
+                  s.editVersion,
+                  backendEditVersion,
+                  editDone && s.isProcessing ? s.editVersion + 1 : s.editVersion,
+                ),
+                instantPreviewUrl: finished ? null : s.instantPreviewUrl,
+                instantPreviewFrame: finished ? null : s.instantPreviewFrame,
                 showToast: (editDone || editError) && s.isProcessing ? true : s.showToast,
                 toastMessage: editDone && s.isProcessing ? "Edit applied successfully"
                   : editError && s.isProcessing ? `Edit failed: ${status.edit_error || "Unknown error"}`
@@ -565,8 +690,10 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
           // Stop polling when all operations are done
           const allDone = !status.segmenting &&
             status.segment_status !== "segmenting" &&
+            status.segment_status !== "propagating" &&
             status.edit_status !== "uploading" &&
             status.edit_status !== "editing" &&
+            status.edit_status !== "processing" &&
             status.refine_status !== "processing" &&
             status.ai_edit_status !== "processing";
 
@@ -579,97 +706,125 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
         }
       };
       poll();
-      pollingRef.current = setInterval(poll, 1500);
+      pollingRef.current = setInterval(poll, intervalMs);
     }
-  }, [projectId]);
+  }, [projectId, handleEditSweep]);
 
   const segmentAtPoint = useCallback((clickX: number, clickY: number) => {
-    setState((s) => {
-      if (!s.projectId) return s;
-      // Don't segment while showing AI preview — preserve the preview state
-      if (s.aiEditStatus === "preview") return s;
+    const currentProjectId = projectId ?? state.projectId;
+    if (!currentProjectId || state.aiEditStatus === "preview" || state.isProcessing || state.isSegmenting) return;
 
-      // Log segmentation change
-      const { addLog } = useChangeLogStore.getState();
-      addLog(s.projectId, {
-        projectId: s.projectId,
-        type: "segment",
-        frameIndex: s.currentFrame,
-        data: {
-          clickX,
-          clickY,
-        },
-      });
+    const frameIndex = state.currentFrame + 1;
+    const { addLog } = useChangeLogStore.getState();
+    addLog(currentProjectId, {
+      projectId: currentProjectId,
+      type: "segment",
+      frameIndex: state.currentFrame,
+      data: { clickX, clickY },
+    });
 
-      fetch(`${API_URL}/segment`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          project_id: s.projectId,
-          frame_index: s.currentFrame + 1,
-          click_x: clickX,
-          click_y: clickY,
-        }),
-      })
-        .then((res) => res.json())
-        .then((data) => {
-          if (data.error) {
-            console.error("Segmentation error:", data.error);
-            setState((prev) => ({
-              ...prev,
-              isSegmenting: false,
-              showToast: true,
-              toastMessage: `Segmentation failed: ${data.error}`,
-            }));
-          }
-          // Restart polling to pick up segmentation completion
-          restartPolling();
-        })
-        .catch((err) => {
-          console.error("Segmentation error:", err);
+    // Keep network I/O outside setState. React may invoke state updaters more
+    // than once in development, which previously submitted duplicate requests.
+    fetch(`${API_URL}/segment`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project_id: currentProjectId,
+        frame_index: frameIndex,
+        click_x: clickX,
+        click_y: clickY,
+      }),
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.error) {
+          console.error("Segmentation error:", data.error);
           setState((prev) => ({
             ...prev,
             isSegmenting: false,
             showToast: true,
-            toastMessage: `Segmentation failed: ${err.message}`,
+            toastMessage: `Segmentation failed: ${data.error}`,
           }));
-        });
+        }
+        restartPolling();
+      })
+      .catch((err) => {
+        console.error("Segmentation error:", err);
+        setState((prev) => ({
+          ...prev,
+          isSegmenting: false,
+          showToast: true,
+          toastMessage: `Segmentation failed: ${err.message}`,
+        }));
+      });
 
-      return {
-        ...s,
-        isSegmenting: true,
-        isProcessing: false,
-        maskCount: 0,
-        selectedObjectId: null,
-        showEditPanel: false,
-      };
-    });
-  }, [restartPolling]);
+    setState((s) => ({
+      ...s,
+      isSegmenting: true,
+      segmentStatus: "segmenting",
+      segmentAnchorFrame: frameIndex,
+      isProcessing: false,
+      maskCount: 0,
+      selectedObjectId: null,
+      showEditPanel: false,
+    }));
+  }, [projectId, restartPolling, state.aiEditStatus, state.currentFrame, state.isProcessing, state.isSegmenting, state.projectId]);
+
+  const confirmSegmentPropagation = useCallback(() => {
+    const currentProjectId = projectId ?? state.projectId;
+    if (!currentProjectId || state.segmentStatus !== "keyframe_ready" || state.isSegmenting) return;
+
+    setState((s) => ({ ...s, isSegmenting: true, segmentStatus: "propagating" }));
+    fetch(`${API_URL}/segment/propagate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project_id: currentProjectId }),
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.error) {
+          setState((s) => ({
+            ...s,
+            isSegmenting: false,
+            segmentStatus: "keyframe_ready",
+            showToast: true,
+            toastMessage: data.error,
+          }));
+          return;
+        }
+        restartPolling(500);
+      })
+      .catch((error) => {
+        setState((s) => ({
+          ...s,
+          isSegmenting: false,
+          segmentStatus: "keyframe_ready",
+          showToast: true,
+          toastMessage: `Mask tracking failed: ${error.message}`,
+        }));
+      });
+  }, [projectId, restartPolling, state.isSegmenting, state.projectId, state.segmentStatus]);
 
   const selectObject = useCallback((id: string | null) => {
-    setState((s) => {
-      // Trigger segmentation when selecting an object
-      if (id !== null && s.projectId && s.frameWidth > 0) {
-        const det = s.detections.find((d) => d.id === id);
-        if (det) {
-          const [xPct, yPct, wPct, hPct] = det.bbox;
-          const clickX = Math.round(((xPct + wPct / 2) / 100) * s.frameWidth);
-          const clickY = Math.round(((yPct + hPct / 2) / 100) * s.frameHeight);
-
-          // Segmentation disabled - no-op
-        }
+    if (id !== null && state.frameWidth > 0 && state.frameHeight > 0) {
+      const detection = state.detections.find((d) => d.id === id);
+      if (detection) {
+        const [xPct, yPct, wPct, hPct] = detection.bbox;
+        const clickX = Math.round(((xPct + wPct / 2) / 100) * state.frameWidth);
+        const clickY = Math.round(((yPct + hPct / 2) / 100) * state.frameHeight);
+        segmentAtPoint(clickX, clickY);
       }
+    }
 
-      return {
-        ...s,
-        selectedObjectId: id,
-        showEditPanel: id !== null,
-        editMode: id !== null ? "recolor" : null,
-        isSegmenting: id !== null,
-        maskCount: 0,
-      };
-    });
-  }, []);
+    setState((s) => ({
+      ...s,
+      selectedObjectId: id,
+      showEditPanel: id !== null,
+      editMode: id !== null ? "recolor" : null,
+      isSegmenting: id !== null || s.isSegmenting,
+      maskCount: id !== null ? 0 : s.maskCount,
+    }));
+  }, [segmentAtPoint, state.detections, state.frameHeight, state.frameWidth]);
 
   const setEditMode = useCallback((mode: EditMode) => {
     setState((s) => ({ ...s, editMode: mode }));
@@ -705,219 +860,235 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
   }, []);
 
   const applyEditAction = useCallback(
-    (action: string, params: { color?: string; prompt?: string; scale?: number }) => {
+    (action: string, params: { color?: string; prompt?: string; scale?: number; dx?: number; dy?: number }) => {
+      const current = state;
+      if (!current.projectId || current.isProcessing || current.isSegmenting || current.isEditPreviewing) return;
+
+      const MASK_ACTIONS = new Set(["delete", "replace", "resize", "blur_region", "recolor", "move", "color_pop", "glow", "bg_replace"]);
+      const isMaskEdit = MASK_ACTIONS.has(action);
+      const startFrame = current.editRangeStart > 0
+        ? current.editRangeStart + 1
+        : (isMaskEdit ? 1 : current.currentFrame + 1);
+      const endFrame = current.editRangeEnd > 0
+        ? current.editRangeEnd + 1
+        : (isMaskEdit ? current.frames.length : current.currentFrame + 1);
+      const editRule: Record<string, unknown> = {
+        edit_type: action,
+        start_frame: startFrame,
+        end_frame: endFrame,
+        preview_frame: current.currentFrame + 1,  // propagation lands here first, sweeps outward
+      };
+      if (params.color) editRule.color = params.color;
+      if (params.prompt) editRule.prompt = params.prompt;
+      if (params.scale) editRule.scale = params.scale;
+      if (params.dx !== undefined) editRule.dx = params.dx;
+      if (params.dy !== undefined) editRule.dy = params.dy;
+
+      if (!PREVIEWABLE_ACTIONS.has(action)) return;
+      const previewFrame0 = current.currentFrame;
+      const pendingEdit: PendingEdit = { action, params: { ...params }, editRule };
+      const isGenerativePreview = action === "replace" || action === "bg_replace";
+
       setState((s) => {
-        if (!s.projectId) return s;
-
-        const MASK_ACTIONS = new Set(["delete", "replace", "resize", "blur_region", "gen_recolor", "recolor"]);
-        const isMaskEdit = MASK_ACTIONS.has(action);
-        const startFrame = s.editRangeStart > 0 ? s.editRangeStart + 1 : (isMaskEdit ? 1 : s.currentFrame + 1);
-        const endFrame = s.editRangeEnd > 0 ? s.editRangeEnd + 1 : (isMaskEdit ? s.frames.length : s.currentFrame + 1);
-        const editRule: Record<string, unknown> = {
-          edit_type: action,
-          start_frame: startFrame,
-          end_frame: endFrame,
-        };
-        if (params.color) editRule.color = params.color;
-        if (params.prompt) editRule.prompt = params.prompt;
-        if (params.scale) editRule.scale = params.scale;
-
-        // Log edit change
-        const { addLog } = useChangeLogStore.getState();
-        addLog(s.projectId, {
-          projectId: s.projectId,
-          type: "edit",
-          frameIndex: s.currentFrame,
-          data: {
-            editType: action,
-            color: params.color,
-            prompt: params.prompt,
-            scale: params.scale,
-            startFrame: startFrame - 1, // Convert to 0-based
-            endFrame: endFrame - 1,
-          },
-        });
-
-        // Add change marker at current frame
-        const markerId = `marker_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-        const newMarker = {
-          id: markerId,
-          frame: s.currentFrame,
-          editType: action,
-          timestamp: Date.now(),
-        };
-
-        fetch(`${API_URL}/edit`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            project_id: s.projectId,
-            edit_rules: [editRule],
-          }),
-        }).then(() => {
-          // Restart polling to track edit progress
-          restartPolling();
-        });
-
+        if (s.instantPreviewUrl) URL.revokeObjectURL(s.instantPreviewUrl);
         return {
           ...s,
-          isProcessing: true,
+          isPlaying: false,
+          isEditPreviewing: true,
+          pendingEdit,
+          instantPreviewUrl: null,
+          instantPreviewFrame: previewFrame0,
           selectedObjectId: null,
           showEditPanel: false,
-          changeMarkers: [...s.changeMarkers, newMarker],
+          showToast: isGenerativePreview ? true : s.showToast,
+          toastMessage: isGenerativePreview
+            ? "Prompt received — Gemini is generating a keyframe preview."
+            : s.toastMessage,
         };
       });
+
+      fetch(`${API_URL}/edit/preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_id: current.projectId,
+          frame_index: previewFrame0 + 1,
+          edit_type: action,
+          color: params.color,
+          prompt: params.prompt,
+          scale: params.scale,
+          dx: params.dx,
+          dy: params.dy,
+        }),
+      })
+        .then(async (res) => {
+          const contentType = res.headers.get("content-type") || "";
+          if (!res.ok || !contentType.includes("image")) {
+            const data = await res.json().catch(() => ({}));
+            throw new Error(data.error || `Preview failed (${res.status})`);
+          }
+          const url = URL.createObjectURL(await res.blob());
+          setState((s) => {
+            if (s.pendingEdit !== pendingEdit) {
+              URL.revokeObjectURL(url);
+              return s;
+            }
+            return {
+              ...s,
+              isEditPreviewing: false,
+              instantPreviewUrl: url,
+              instantPreviewFrame: previewFrame0,
+            };
+          });
+        })
+        .catch((err) => {
+          setState((s) => ({
+            ...s,
+            isEditPreviewing: false,
+            pendingEdit: null,
+            instantPreviewFrame: null,
+            editStatus: "error",
+            showToast: true,
+            toastMessage: `Preview failed: ${err.message}`,
+          }));
+        });
     },
-    [restartPolling]
+    [state]
   );
 
-  const refineFrame = useCallback(() => {
+  const confirmEditPropagation = useCallback(() => {
+    const current = state;
+    const pending = current.pendingEdit;
+    if (!current.projectId || !pending || current.isEditPreviewing || current.isProcessing) return;
+
+    const startFrame = Number(pending.editRule.start_frame);
+    const endFrame = Number(pending.editRule.end_frame);
+    const { addLog } = useChangeLogStore.getState();
+    addLog(current.projectId, {
+      projectId: current.projectId,
+      type: "edit",
+      frameIndex: current.currentFrame,
+      data: {
+        editType: pending.action,
+        color: pending.params.color,
+        prompt: pending.params.prompt,
+        scale: pending.params.scale,
+        startFrame: startFrame - 1,
+        endFrame: endFrame - 1,
+      },
+    });
+
+    const markerId = `marker_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
+    const newMarker = {
+      id: markerId,
+      frame: current.currentFrame,
+      editType: pending.action,
+      timestamp: Date.now(),
+      params: { ...pending.params },
+    };
+
+    sweepMarkedRef.current = null;
+    fetch(`${API_URL}/edit`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project_id: current.projectId, edit_rules: [pending.editRule] }),
+    })
+      .then(async (res) => {
+        const data = await res.json();
+        if (!res.ok || data.error) {
+          throw new Error(data.error || `Edit request failed (${res.status})`);
+        }
+        if (pollingRef.current) clearInterval(pollingRef.current);
+        pollingRef.current = null;
+        restartPolling(500);
+      })
+      .catch((err) => {
+        setState((s) => ({
+          ...s,
+          isProcessing: false,
+          editStatus: "error",
+          showToast: true,
+          toastMessage: `Edit failed: ${err.message}`,
+        }));
+      });
+
+    setState((s) => ({
+      ...s,
+      pendingEdit: null,
+      isProcessing: true,
+      isPlaying: true,
+      editStatus: "editing",
+      editPhase: "applying",
+      editProgress: { done: 0, total: endFrame - startFrame + 1 },
+      changeMarkers: [...s.changeMarkers, newMarker],
+    }));
+  }, [restartPolling, state]);
+
+  const cancelEditPreview = useCallback(() => {
     setState((s) => {
-      if (!s.projectId) return s;
-
-      // Use slider range if set, otherwise use current frame only
-      const startFrame = s.editRangeStart >= 0 ? s.editRangeStart + 1 : s.currentFrame + 1;
-      const endFrame = s.editRangeEnd > 0 ? s.editRangeEnd + 1 : s.currentFrame + 1;
-
-      // Log refine change
-      const { addLog } = useChangeLogStore.getState();
-      addLog(s.projectId, {
-        projectId: s.projectId,
-        type: "refine",
-        frameIndex: s.currentFrame,
-        data: {
-          prompt: "Make realistic",
-        },
-      });
-
-      // Add change marker for refine
-      const markerId = `marker_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-      const newMarker = {
-        id: markerId,
-        frame: s.currentFrame,
-        editType: "refine",
-        timestamp: Date.now(),
-      };
-
-      fetch(`${API_URL}/edit/refine`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          project_id: s.projectId,
-          frame_index: s.currentFrame + 1,
-          start_frame: startFrame,
-          end_frame: endFrame,
-        }),
-      }).then(() => {
-        restartPolling();
-      });
-
+      if (s.instantPreviewUrl) URL.revokeObjectURL(s.instantPreviewUrl);
       return {
         ...s,
-        isProcessing: true,
-        changeMarkers: [...s.changeMarkers, newMarker],
+        pendingEdit: null,
+        isEditPreviewing: false,
+        instantPreviewUrl: null,
+        instantPreviewFrame: null,
       };
     });
-  }, [restartPolling]);
-
-  const propagateEdit = useCallback((prompt: string) => {
-    setState((s) => {
-      if (!s.projectId) return s;
-
-      // Get all change logs for this project
-      const { getLogs } = useChangeLogStore.getState();
-      const changeLogs = getLogs(s.projectId);
-
-      // Use slider range if set, otherwise use current frame only
-      const startFrame = s.editRangeStart >= 0 ? s.editRangeStart + 1 : s.currentFrame + 1;
-      const endFrame = s.editRangeEnd > 0 ? s.editRangeEnd + 1 : startFrame; // If no end set, only process start frame
-
-      fetch(`${API_URL}/edit/propagate`, {
+    if (state.projectId) {
+      fetch(`${API_URL}/edit/preview/cancel`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          project_id: s.projectId,
-          frame_index: s.currentFrame + 1,
-          prompt,
-          start_frame: startFrame,
-          end_frame: endFrame,
-          change_logs: changeLogs, // Send all logged changes
-        }),
-      }).then(() => {
-        restartPolling();
-      });
-
-      return {
-        ...s,
-        aiEditStatus: "applying",
-        aiEditPhase: "transforming",
-        aiEditProgress: { done: 0, total: 0 },
-        aiInterpolationProgress: { done: 0, total: 0 },
-      };
-    });
-  }, [restartPolling]);
+        body: JSON.stringify({ project_id: state.projectId }),
+      }).catch(() => {});
+    }
+  }, [state.projectId]);
 
   const handleMarkerDrag = useCallback((markerId: string, newFrame: number) => {
-    setState((s) => {
-      // Find the marker
-      const marker = s.changeMarkers.find((m) => m.id === markerId);
-      if (!marker || !s.projectId) return s;
+    const current = state;
+    const marker = current.changeMarkers.find((m) => m.id === markerId);
+    if (!marker || !current.projectId || current.isProcessing) return;
 
-      // Update marker position
-      const updatedMarkers = s.changeMarkers.map((m) =>
+    const startFrame = newFrame;
+    const endFrame = current.editRangeEnd > 0 ? current.editRangeEnd : current.frames.length - 1;
+    const editRule: Record<string, unknown> = {
+      edit_type: marker.editType,
+      start_frame: startFrame + 1,
+      end_frame: endFrame + 1,
+      ...marker.params,
+    };
+
+    fetch(`${API_URL}/edit`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project_id: current.projectId, edit_rules: [editRule] }),
+    })
+      .then(async (res) => {
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || `Edit request failed (${res.status})`);
+        restartPolling();
+      })
+      .catch((err) => {
+        setState((s) => ({
+          ...s,
+          isProcessing: false,
+          editStatus: "error",
+          showToast: true,
+          toastMessage: `Edit failed: ${err.message}`,
+        }));
+      });
+
+    setState((s) => ({
+      ...s,
+      changeMarkers: s.changeMarkers.map((m) =>
         m.id === markerId ? { ...m, frame: newFrame } : m
-      );
-
-      // Update edit range to propagate from marker frame to end
-      const startFrame = newFrame;
-      const endFrame = s.editRangeEnd > 0 ? s.editRangeEnd : s.frames.length - 1;
-
-      // Trigger propagation based on edit type
-      if (marker.editType === "refine") {
-        // For refine, propagate the realistic enhancement
-        fetch(`${API_URL}/edit/propagate`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            project_id: s.projectId,
-            frame_index: newFrame + 1,
-            prompt: "Apply the same realistic enhancement consistently",
-            start_frame: startFrame + 1,
-            end_frame: endFrame + 1,
-            interval: 8,
-          }),
-        }).then(() => {
-          restartPolling();
-        });
-      } else {
-        // For other edits, propagate the edit type
-        const editRule: Record<string, unknown> = {
-          edit_type: marker.editType,
-          start_frame: startFrame + 1,
-          end_frame: endFrame + 1,
-        };
-
-        fetch(`${API_URL}/edit`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            project_id: s.projectId,
-            edit_rules: [editRule],
-          }),
-        }).then(() => {
-          restartPolling();
-        });
-      }
-
-      return {
-        ...s,
-        changeMarkers: updatedMarkers,
-        editRangeStart: startFrame,
-        editRangeEnd: endFrame,
-        isProcessing: true,
-      };
-    });
-  }, [restartPolling]);
+      ),
+      editRangeStart: startFrame,
+      editRangeEnd: endFrame,
+      isProcessing: true,
+      editStatus: "editing",
+    }));
+  }, [restartPolling, state]);
 
   const undoEdit = useCallback(() => {
     setState((s) => {
@@ -964,12 +1135,20 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
     setState((s) => {
       // Clear preview when changing frames (unless we're applying the edit)
       const shouldClearPreview = s.aiEditStatus === "preview" && s.currentFrame !== frame;
+      const shouldDiscardPendingEdit = s.pendingEdit !== null && s.currentFrame !== frame;
+      if (shouldDiscardPendingEdit && s.instantPreviewUrl) {
+        URL.revokeObjectURL(s.instantPreviewUrl);
+      }
       return {
         ...s,
         currentFrame: frame,
         // Clear preview when navigating away
         aiPreviewFrameUrl: shouldClearPreview ? null : s.aiPreviewFrameUrl,
         aiEditStatus: shouldClearPreview ? "idle" : s.aiEditStatus,
+        pendingEdit: shouldDiscardPendingEdit ? null : s.pendingEdit,
+        isEditPreviewing: shouldDiscardPendingEdit ? false : s.isEditPreviewing,
+        instantPreviewUrl: shouldDiscardPendingEdit ? null : s.instantPreviewUrl,
+        instantPreviewFrame: shouldDiscardPendingEdit ? null : s.instantPreviewFrame,
       };
     });
   }, []);
@@ -1005,208 +1184,6 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
 
   const hideToast = useCallback(() => {
     setState((s) => ({ ...s, showToast: false }));
-  }, []);
-
-  const sendAIPrompt = useCallback((prompt: string) => {
-    setState((s) => {
-      if (!s.projectId) return s;
-
-      // Add user message to chat history
-      const userMessage: ChatMessage = {
-        role: "user",
-        message: prompt,
-        timestamp: Date.now(),
-      };
-
-      setState((prev) => ({
-        ...prev,
-        aiChatHistory: [...prev.aiChatHistory, userMessage],
-        isAIGenerating: true,
-        aiEditStatus: "idle",
-      }));
-
-      // Call preview endpoint
-      fetch(`${API_URL}/ai/edit/preview`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          project_id: s.projectId,
-          frame_index: s.currentFrame + 1,
-          prompt: prompt,
-        }),
-      })
-        .then(async (res) => {
-          if (!res.ok) {
-            const errorData = await res.json().catch(() => ({ error: "Unknown error" }));
-            throw new Error(errorData.error || `HTTP ${res.status}`);
-          }
-          return res.json();
-        })
-        .then((data) => {
-          if (data.error) {
-            throw new Error(data.error);
-          }
-          const previewUrl = `${API_URL}${data.preview_url}`;
-          console.log("Preview URL:", previewUrl);
-          const assistantMessage: ChatMessage = {
-            role: "assistant",
-            message: "Preview generated! Review it in the canvas.",
-            timestamp: Date.now(),
-          };
-          acceptInProgressRef.current = false; // Reset so accept button works
-          setState((prev) => ({
-            ...prev,
-            aiChatHistory: [...prev.aiChatHistory, assistantMessage],
-            aiPreviewFrameUrl: previewUrl,
-            aiGenerationId: data.generation_id,
-            isAIGenerating: false,
-            aiEditStatus: "preview",
-          }));
-        })
-        .catch((err) => {
-          console.error("AI preview error:", err);
-          setState((prev) => ({
-            ...prev,
-            isAIGenerating: false,
-            aiEditStatus: "idle",
-            showToast: true,
-            toastMessage: `Failed to generate preview: ${err.message}`,
-          }));
-        });
-
-      return s;
-    });
-  }, []);
-
-  const acceptAIGeneration = useCallback(() => {
-    if (acceptInProgressRef.current) return;
-
-    setState((s) => {
-      if (!s.projectId || !s.aiGenerationId) return s;
-      if (s.aiEditStatus === "applying") return s;
-
-      acceptInProgressRef.current = true;
-      const generationId = s.aiGenerationId;
-      // Use slider range if set, otherwise use current frame only
-      const startFrame = s.editRangeStart >= 0 ? s.editRangeStart + 1 : s.currentFrame + 1;
-      const endFrame = s.editRangeEnd > 0 ? s.editRangeEnd + 1 : s.currentFrame + 1;
-      const interval = 8;
-
-      fetch(`${API_URL}/ai/edit/accept`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          project_id: s.projectId,
-          generation_id: generationId,
-          start_frame: startFrame,
-          end_frame: endFrame,
-          interval: interval,
-        }),
-      })
-        .then((res) => res.json())
-        .then((data) => {
-          if (data.error && data.status !== "processing") {
-            acceptInProgressRef.current = false;
-            setState((prev) => ({
-              ...prev,
-              aiEditStatus: "idle" as const,
-              showToast: true,
-              toastMessage: data.error,
-            }));
-          }
-          // Status is "processing" — polling will handle progress updates
-          restartPolling();
-        })
-        .catch((err) => {
-          acceptInProgressRef.current = false;
-          setState((prev) => ({
-            ...prev,
-            aiEditStatus: "idle" as const,
-            showToast: true,
-            toastMessage: `Failed to accept: ${err.message}`,
-          }));
-        });
-
-      return {
-        ...s,
-        aiEditStatus: "applying" as const,
-        aiPreviewFrameUrl: null,
-        aiGenerationId: null,
-        aiEditProgress: { done: 0, total: 0 },
-        aiEditPhase: "transforming" as const,
-        aiInterpolationProgress: { done: 0, total: 0 },
-      };
-    });
-  }, [restartPolling]);
-
-  const rejectAIGeneration = useCallback(() => {
-    setState((s) => {
-      if (!s.projectId || !s.aiGenerationId) return s;
-
-      fetch(`${API_URL}/ai/edit/reject`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          project_id: s.projectId,
-          generation_id: s.aiGenerationId,
-        }),
-      });
-
-      acceptInProgressRef.current = false;
-      return {
-        ...s,
-        aiPreviewFrameUrl: null,
-        aiGenerationId: null,
-        aiEditStatus: "idle",
-      };
-    });
-  }, []);
-
-  const retryAIGeneration = useCallback(() => {
-    setState((s) => {
-      if (!s.projectId || !s.aiGenerationId) return s;
-
-      setState((prev) => ({
-        ...prev,
-        isAIGenerating: true,
-      }));
-
-      fetch(`${API_URL}/ai/edit/retry`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          project_id: s.projectId,
-          generation_id: s.aiGenerationId,
-        }),
-      })
-        .then((res) => res.json())
-        .then((data) => {
-          const assistantMessage: ChatMessage = {
-            role: "assistant",
-            message: "Preview regenerated! Review it below.",
-            timestamp: Date.now(),
-          };
-          setState((prev) => ({
-            ...prev,
-            aiChatHistory: [...prev.aiChatHistory, assistantMessage],
-            aiPreviewFrameUrl: `${API_URL}${data.preview_url}`,
-            aiGenerationId: data.generation_id,
-            isAIGenerating: false,
-            aiEditStatus: "preview",
-          }));
-        })
-        .catch((err) => {
-          console.error("AI retry error:", err);
-          setState((prev) => ({
-            ...prev,
-            isAIGenerating: false,
-            showToast: true,
-            toastMessage: "Failed to retry generation",
-          }));
-        });
-
-      return s;
-    });
   }, []);
 
   const selectedObject = useMemo(
@@ -1261,14 +1238,15 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
     loadVideo,
     detectObjects,
     segmentAtPoint,
+    confirmSegmentPropagation,
     selectObject,
     setEditMode,
     updateEditParams,
     applyEdit,
     cancelEdit,
     applyEditAction,
-    refineFrame,
-    propagateEdit,
+    confirmEditPropagation,
+    cancelEditPreview,
     undoEdit,
     setCurrentFrame,
     togglePlay,
@@ -1278,10 +1256,6 @@ export function useEditorState(projectId?: string, initialFrame = 0) {
     closeEditPanel,
     setVideoName,
     hideToast,
-    sendAIPrompt,
-    acceptAIGeneration,
-    rejectAIGeneration,
-    retryAIGeneration,
     editProgress: state.editProgress,
     editStatus: state.editStatus,
     changeMarkers: state.changeMarkers,

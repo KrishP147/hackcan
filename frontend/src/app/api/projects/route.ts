@@ -1,8 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth0 } from "@/lib/auth0";
 import { supabaseAdmin } from "@/lib/supabase";
+import { objectExists, originalPath } from "@/lib/project-storage";
+
+const PROJECT_ID = /^[a-f0-9-]{8,36}$/i;
 
 export async function GET() {
+  if (!supabaseAdmin) {
+    return NextResponse.json({ error: "Project sync is not configured" }, { status: 503 });
+  }
   const session = await auth0.getSession();
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
@@ -17,26 +23,121 @@ export async function GET() {
 }
 
 export async function POST(req: NextRequest) {
+  if (!supabaseAdmin) {
+    return NextResponse.json({ error: "Project sync is not configured" }, { status: 503 });
+  }
   const session = await auth0.getSession();
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   const body = await req.json();
   const { project_id, name, thumbnail_url } = body;
 
-  if (!project_id) return NextResponse.json({ error: "project_id required" }, { status: 400 });
+  if (typeof project_id !== "string" || !PROJECT_ID.test(project_id)) {
+    return NextResponse.json({ error: "Valid project_id required" }, { status: 400 });
+  }
 
-  const { data, error } = await supabaseAdmin
+  const userId = session.user.sub;
+  const safeName = typeof name === "string" && name.trim()
+    ? name.trim().slice(0, 255)
+    : null;
+  const safeThumbnail = typeof thumbnail_url === "string"
+    ? thumbnail_url.slice(0, 2048)
+    : null;
+
+  // Registration is idempotent. It lets a guest-created project be attached
+  // after the user signs in, while preventing an existing project from being
+  // reassigned to a different Auth0 identity.
+  const { data: existing, error: existingError } = await supabaseAdmin
     .from("projects")
-    .insert({
-      project_id,
-      user_id: session.user.sub,
-      name: name || "Untitled Project",
-      thumbnail_url: thumbnail_url || null,
-      status: "created",
-      last_frame: 0,
-    })
+    .select("*")
+    .eq("project_id", project_id)
+    .maybeSingle();
+
+  if (existingError) {
+    return NextResponse.json({ error: existingError.message }, { status: 500 });
+  }
+  if (existing && existing.user_id !== userId) {
+    return NextResponse.json({ error: "Project already belongs to another user" }, { status: 409 });
+  }
+  if (existing) {
+    const updates: {
+      name?: string;
+      thumbnail_url?: string;
+      original_path?: string;
+      storage_status?: string;
+    } = {};
+    if (safeName) updates.name = safeName;
+    if (safeThumbnail) updates.thumbnail_url = safeThumbnail;
+    if (!existing.original_path) {
+      const durableOriginal = originalPath(project_id);
+      if (await objectExists(durableOriginal)) {
+        updates.original_path = durableOriginal;
+        updates.storage_status = "stored";
+      }
+    }
+
+    // Opening an existing project often happens before its client-side name
+    // has been hydrated. Do not replace durable metadata with a fallback.
+    if (Object.keys(updates).length === 0) {
+      return NextResponse.json(existing);
+    }
+
+    let { data, error } = await supabaseAdmin
+      .from("projects")
+      .update(updates)
+      .eq("project_id", project_id)
+      .eq("user_id", userId)
+      .select()
+      .single();
+    if (error?.code === "PGRST204") {
+      const legacyUpdates: { name?: string; thumbnail_url?: string } = {};
+      if (updates.name) legacyUpdates.name = updates.name;
+      if (updates.thumbnail_url) legacyUpdates.thumbnail_url = updates.thumbnail_url;
+      if (Object.keys(legacyUpdates).length === 0) return NextResponse.json(existing);
+      ({ data, error } = await supabaseAdmin
+        .from("projects")
+        .update(legacyUpdates)
+        .eq("project_id", project_id)
+        .eq("user_id", userId)
+        .select()
+        .single());
+    }
+    if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+    return NextResponse.json(data);
+  }
+
+  const durableOriginal = originalPath(project_id);
+  const hasDurableOriginal = await objectExists(durableOriginal);
+  const extendedProject = {
+    project_id,
+    user_id: userId,
+    name: safeName ?? "Untitled Project",
+    thumbnail_url: safeThumbnail,
+    original_path: hasDurableOriginal ? durableOriginal : null,
+    storage_status: hasDurableOriginal ? "stored" : "pending",
+    status: "created",
+    last_frame: 0,
+  };
+  let { data, error } = await supabaseAdmin
+    .from("projects")
+    .insert(extendedProject)
     .select()
     .single();
+
+  if (error?.code === "PGRST204") {
+    ({ data, error } = await supabaseAdmin
+      .from("projects")
+      .insert({
+        project_id,
+        user_id: userId,
+        name: safeName ?? "Untitled Project",
+        thumbnail_url: safeThumbnail,
+        status: hasDurableOriginal ? "stored" : "created",
+        last_frame: 0,
+      })
+      .select()
+      .single());
+  }
 
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
   return NextResponse.json(data);

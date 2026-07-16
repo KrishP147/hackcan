@@ -22,12 +22,12 @@ export function TopBar() {
           : "bg-transparent"
       }`}
     >
-      <div className="max-w-7xl mx-auto px-6 md:px-12 lg:px-24 h-16 flex items-center justify-between">
+      <div className="max-w-7xl mx-auto px-6 md:px-12 lg:px-24 h-20 flex items-center justify-between">
         <a href="/" className="flex items-center gap-2 animate-logo-intro">
-          <div className="w-8 h-8 rounded-full bg-[var(--fg)] flex items-center justify-center transition-colors duration-300 hover:bg-[var(--accent)]">
-            <Play className="w-3.5 h-3.5 text-white ml-0.5" fill="white" />
+          <div className="w-11 h-11 rounded-full bg-[var(--fg)] flex items-center justify-center transition-colors duration-300 hover:bg-[var(--accent)]">
+            <Play className="w-5 h-5 text-white ml-0.5" fill="white" />
           </div>
-          <span className="text-lg font-semibold tracking-tight">
+          <span className="text-2xl font-semibold tracking-tight">
             FrameShift
           </span>
         </a>
@@ -50,19 +50,27 @@ export function TopBar() {
                 />
               )}
               <a
-                href="/api/auth/logout"
+                href="/auth/logout"
                 className="text-sm text-[var(--fg-muted)] hover:text-[var(--accent)] transition-colors"
               >
                 Sign out
               </a>
             </>
           ) : (
-            <a
-              href="/api/auth/login?returnTo=/dashboard"
-              className="text-sm font-semibold bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white px-5 py-2 rounded-xl transition-all duration-300 hover:scale-[1.02] active:scale-[0.98]"
-            >
-              Sign in
-            </a>
+            <>
+              <a
+                href="/auth/login?returnTo=/dashboard"
+                className="text-base font-semibold bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white px-7 py-3 rounded-2xl transition-all duration-300 hover:scale-[1.02] active:scale-[0.98]"
+              >
+                Log in
+              </a>
+              <a
+                href="/auth/login?screen_hint=signup&returnTo=/dashboard"
+                className="rounded-2xl border border-[var(--fg)] px-7 py-3 text-base font-semibold text-[var(--fg)] transition-all duration-300 hover:border-[var(--accent)] hover:text-[var(--accent)] hover:scale-[1.02] active:scale-[0.98]"
+              >
+                Sign up
+              </a>
+            </>
           )}
         </div>
       </div>

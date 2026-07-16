@@ -1,47 +1,250 @@
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, Depends
+from fastapi import (FastAPI, UploadFile, File, BackgroundTasks, Depends,
+                     HTTPException, Header)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from dotenv import load_dotenv
+
+# Load local configuration before importing services that read environment
+# variables (notably Auth0 and the projects directory).
+load_dotenv()
+
 from pydantic import BaseModel
 from typing import Optional, List
 import shutil
 import asyncio
+import math
+from functools import partial
 import numpy as np
 import uuid
+import json
+import os
+import re
+import secrets
+import tarfile
+import tempfile
 from pathlib import Path
 from io import BytesIO
+from urllib.parse import urlparse
 
-from services import cloudinary_service, project_manager, ffmpeg_service, sam2_service, gemini_service, rife_service, storage_service
-from services.auth_service import get_current_user
+import httpx
+
+from services import (project_manager, ffmpeg_service, sam2_service, config,
+                      supabase_storage_service)
+from services.auth_service import get_current_user, is_auth0_configured
 # film_service  # FILM disabled - using RIFE instead
-
-load_dotenv()
 
 app = FastAPI(title="FrameShift AI")
 
 # Track cancellable operations per project
 _cancel_flags: dict[str, bool] = {}
 
+import os as _os_cors
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://your-vercel-domain.vercel.app"],
+    allow_origins=[o for o in ("http://localhost:3000",
+                               _os_cors.getenv("FRONTEND_ORIGIN")) if o],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*", "Authorization"],
 )
 
+# Per-IP token bucket (30 req/min, refill 0.5/s) — enabled via RATE_LIMIT=1 (Modal deploy)
+import os as _os
+import time as _time
+
+_rate_buckets: dict[str, tuple[float, float]] = {}  # ip -> (tokens, last_refill)
+
+if _os.getenv("RATE_LIMIT", "0") == "1":
+    @app.middleware("http")
+    async def rate_limit(request, call_next):
+        from fastapi.responses import JSONResponse
+        ip = request.client.host if request.client else "unknown"
+        tokens, last = _rate_buckets.get(ip, (30.0, _time.monotonic()))
+        now = _time.monotonic()
+        tokens = min(30.0, tokens + (now - last) * 0.5)
+        if tokens < 1.0:
+            _rate_buckets[ip] = (tokens, now)
+            return JSONResponse({"error": "Rate limit exceeded"}, status_code=429)
+        _rate_buckets[ip] = (tokens - 1.0, now)
+        return await call_next(request)
+
 
 @app.on_event("startup")
 async def startup():
     project_manager.reset_stuck_projects()
+    print(f"[Startup] compute device: {config.get_device()}")
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "compute_device": str(config.get_device()),
+        "auth0_configured": is_auth0_configured(),
+    }
 
 
 # --- Upload ---
+
+MAX_UPLOAD_DURATION_SECONDS = 6.0
+PROJECT_ID_PATTERN = re.compile(r"^[a-f0-9]{32}$")
+
+
+def _validate_upload_duration(video_path: Path) -> float:
+    try:
+        duration = float(ffmpeg_service.probe_video(video_path)["duration"])
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload a valid, supported video file.",
+        ) from exc
+
+    if not math.isfinite(duration) or duration <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not determine the video's duration.",
+        )
+    if duration >= MAX_UPLOAD_DURATION_SECONDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Video must be under {MAX_UPLOAD_DURATION_SECONDS:g} seconds "
+                f"(received {duration:.1f} seconds)."
+            ),
+        )
+
+    return duration
+
+
+class ImportProjectRequest(BaseModel):
+    project_id: str
+    source_url: str
+    checkpoint_url: str | None = None
+    user_id: str | None = None
+    original_path: str | None = None
+    current_path: str | None = None
+    checkpoint_path: str | None = None
+
+
+def _validate_storage_url(value: str) -> None:
+    expected_host = urlparse(os.getenv("SUPABASE_URL", "")).hostname
+    parsed = urlparse(value)
+    if (not expected_host or parsed.scheme != "https" or
+            parsed.hostname != expected_host or
+            not parsed.path.startswith("/storage/v1/object/sign/")):
+        raise ValueError("Only signed URLs from the configured Supabase project are allowed")
+
+
+def _download_signed_object(url: str, destination: Path) -> None:
+    _validate_storage_url(url)
+    temporary = destination.with_suffix(destination.suffix + ".download")
+    with httpx.stream("GET", url, follow_redirects=True, timeout=180.0) as response:
+        response.raise_for_status()
+        with temporary.open("wb") as output:
+            for chunk in response.iter_bytes():
+                output.write(chunk)
+    temporary.replace(destination)
+
+
+def _restore_checkpoint(project_id: str, checkpoint_url: str) -> None:
+    project_dir = project_manager.get_project_dir(project_id)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        archive_path = Path(temp_dir) / "checkpoint.tar.gz"
+        _download_signed_object(checkpoint_url, archive_path)
+        with tarfile.open(archive_path, "r:gz") as archive:
+            status_member = archive.getmember("status.json") if "status.json" in archive.getnames() else None
+            if status_member:
+                status_file = archive.extractfile(status_member)
+                if status_file:
+                    saved = json.load(status_file)
+                    restorable = {
+                        key: saved[key]
+                        for key in (
+                            "anchor_frame", "click_x", "click_y", "mask_count",
+                            "segment_status", "edit_version", "flow_status",
+                        )
+                        if key in saved
+                    }
+                    project_manager.update_status(project_id, **restorable)
+
+            masks_dir = project_dir / "masks"
+            masks_dir.mkdir(exist_ok=True)
+            for member in archive.getmembers():
+                if not member.isfile() or not re.fullmatch(r"masks/mask_\d{4}\.png", member.name):
+                    continue
+                source = archive.extractfile(member)
+                if source:
+                    (masks_dir / Path(member.name).name).write_bytes(source.read())
+
+
+def _background_import_project(req: ImportProjectRequest) -> None:
+    try:
+        project = project_manager.create_project(req.project_id)
+        project_dir = Path(project["project_dir"])
+        project_manager.update_status(
+            req.project_id,
+            status="hydrating",
+            user_id=req.user_id,
+            storage_original_path=req.original_path,
+            storage_current_path=req.current_path,
+            storage_checkpoint_path=req.checkpoint_path,
+            error=None,
+        )
+        video_path = project_dir / "original.mp4"
+        _download_signed_object(req.source_url, video_path)
+        duration = _validate_upload_duration(video_path)
+        project_manager.update_status(req.project_id, duration=duration)
+
+        if req.checkpoint_url:
+            _restore_checkpoint(req.project_id, req.checkpoint_url)
+
+        # A hydrated cache is immediately made editor-ready. The browser does
+        # not need to issue a second upload or extraction request.
+        _background_extract(req.project_id)
+    except Exception as exc:
+        print(f"[import] project hydration failed for {req.project_id}: {exc}")
+        try:
+            project_manager.update_status(
+                req.project_id, status="error", error=f"Storage hydration failed: {exc}")
+        except Exception:
+            pass
+
+
+@app.post("/project/import", status_code=202)
+async def import_project_from_storage(
+    req: ImportProjectRequest,
+    background_tasks: BackgroundTasks,
+    x_frameshift_import_secret: str | None = Header(default=None),
+):
+    configured_secret = os.getenv("FRAMESHIFT_IMPORT_SECRET", "")
+    if not configured_secret:
+        raise HTTPException(status_code=503, detail="Storage hydration is not configured")
+    if not x_frameshift_import_secret or not secrets.compare_digest(
+        x_frameshift_import_secret, configured_secret
+    ):
+        raise HTTPException(status_code=401, detail="Invalid storage hydration secret")
+    if not PROJECT_ID_PATTERN.fullmatch(req.project_id):
+        raise HTTPException(status_code=400, detail="Invalid project_id")
+    try:
+        _validate_storage_url(req.source_url)
+        if req.checkpoint_url:
+            _validate_storage_url(req.checkpoint_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    existing_status = project_manager.get_status(req.project_id)
+    try:
+        existing_dir = project_manager.get_project_dir(req.project_id)
+        if (existing_status.get("status") == "ready" and
+                any((existing_dir / "frames").glob("frame_*.jpg"))):
+            return {"project_id": req.project_id, "status": "ready", "cache": "hit"}
+    except FileNotFoundError:
+        pass
+
+    project_manager.create_project(req.project_id)
+    project_manager.update_status(req.project_id, status="hydrating", error=None)
+    background_tasks.add_task(_background_import_project, req)
+    return {"project_id": req.project_id, "status": "hydrating", "cache": "miss"}
 
 @app.post("/upload")
 async def upload_video(
@@ -56,10 +259,17 @@ async def upload_video(
         project_manager.update_status(project["project_id"], user_id=current_user.get("sub"))
 
     video_path = project_dir / "original.mp4"
-    with open(video_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    try:
+        with open(video_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        duration = _validate_upload_duration(video_path)
+    except Exception:
+        shutil.rmtree(project_dir, ignore_errors=True)
+        raise
 
-    # Video uploaded and staged for Cloudinary processing
+    project_manager.update_status(project["project_id"], duration=duration)
+
+    # Video is staged on the local project volume for FFmpeg processing.
     return {
         "project_id": project["project_id"],
     }
@@ -76,10 +286,16 @@ def _background_extract(project_id: str):
     video_path = project_dir / "original.mp4"
     frames_dir = project_dir / "frames"
 
-    # Extract frames
+    # Extract frames at native fps, 720p working resolution
     project_manager.update_status(project_id, status="extracting")
     try:
-        frame_count = ffmpeg_service.extract_frames(video_path, frames_dir)
+        info = ffmpeg_service.probe_video(video_path)
+        if info["duration"] >= MAX_UPLOAD_DURATION_SECONDS:
+            project_manager.update_status(
+                project_id, status="error",
+                error="Video must be under 6 seconds")
+            return
+        frame_count, used_fps = ffmpeg_service.extract_frames(video_path, frames_dir)
     except Exception as e:
         print(f"[extract] FFmpeg failed: {e}")
         project_manager.update_status(project_id, status="error", error=str(e))
@@ -93,17 +309,21 @@ def _background_extract(project_id: str):
 
     # Mark ready immediately so frontend can show frames via API
     project_manager.update_status(project_id, status="ready", frame_count=frame_count,
+                                   fps=used_fps,
                                    frame_width=frame_width, frame_height=frame_height,
                                    detecting=False, detections={})
 
-    # Upload frames to Supabase Storage for persistent access
-    try:
-        storage_base_url = storage_service.upload_frames(project_id, frames_dir)
-        if storage_base_url:
-            project_manager.update_status(project_id, storage_base_url=storage_base_url)
-            print(f"[extract] Frames uploaded to Supabase Storage: {storage_base_url}")
-    except Exception as e:
-        print(f"[extract] Supabase Storage upload failed (non-fatal): {e}")
+    # Durable media lives in Supabase. The Volume remains only a fast cache.
+    supabase_storage_service.sync_extract_metadata(project_id)
+
+    # Flow is lazy by default. Starting RAFT here used to contend with SAM2 as
+    # soon as the user clicked an object. It can still be enabled explicitly
+    # for local benchmarking.
+    if config.should_precompute_flows():
+        import threading
+        threading.Thread(target=_background_flows, args=(project_id,), daemon=True).start()
+    else:
+        project_manager.update_status(project_id, flow_status="deferred")
 
     # YOLO detection disabled
     # # Run YOLO on all frames, updating detections progressively
@@ -117,6 +337,33 @@ def _background_extract(project_id: str):
     #         project_manager.update_status(project_id, detections=detections, detected_frames=i)
     # 
     # project_manager.update_status(project_id, detecting=False, detections=detections, detected_frames=len(frame_files))
+
+def _background_flows(project_id: str):
+    """Pairwise RAFT flow over the whole clip, cached to flows/. Safe to call
+    repeatedly — already-cached pairs are skipped."""
+    try:
+        status = project_manager.get_status(project_id)
+        if status.get("flow_status") == "computing":
+            return
+        project_manager.update_status(project_id, flow_status="computing")
+        from services import config as _config, flow_service
+        project_dir = project_manager.get_project_dir(project_id)
+        with _config.gpu_job(f"raft:{project_id}"):
+            flow_service.compute_flows(
+                project_dir / "frames", project_dir / "flows",
+                device=_config.get_device(),
+            )
+        project_manager.update_status(project_id, flow_status="done")
+    except Exception as e:
+        project_manager.update_status(project_id, flow_status="error", flow_error=str(e))
+
+
+@app.post("/flows/precompute")
+async def precompute_flows(req: ExtractRequest):
+    """Manually invoke optical-flow precompute for a project (idempotent)."""
+    asyncio.ensure_future(asyncio.to_thread(_background_flows, req.project_id))
+    return {"project_id": req.project_id, "flow_status": "computing"}
+
 
 @app.post("/extract")
 async def extract_frames(req: ExtractRequest, background_tasks: BackgroundTasks):
@@ -167,28 +414,27 @@ async def get_frame(project_id: str, frame_index: int):
 #     project_id: str
 #     frame_index: int
 
-# @app.post("/detect")
-# async def detect_objects(req: DetectRequest):
-#     project_dir = project_manager.get_project_dir(req.project_id)
-#     frame_path = project_dir / "frames" / f"frame_{req.frame_index:04d}.jpg"
-# 
-#     if not frame_path.exists():
-#         return {"error": "Frame not found"}
-# 
-#     detections = yolo_service.detect(frame_path)
-#     return {"project_id": req.project_id, "frame_index": req.frame_index, "objects": detections}
-
-
-# --- Segment ---
-
 class SegmentRequest(BaseModel):
     project_id: str
     frame_index: int
     click_x: int
     click_y: int
 
-async def _background_segment_and_propagate(project_id: str, frame_index: int, click_x: int, click_y: int):
-    """Background task: segment only the clicked frame (no propagation)."""
+
+def _segment_frame_serialized(frame_path: Path, click_x: int, click_y: int):
+    with config.gpu_job("sam2:keyframe"):
+        return sam2_service.segment_frame(frame_path, click_x, click_y)
+
+
+def _propagate_masks_serialized(propagate):
+    with config.gpu_job("sam2:tracking"):
+        return propagate()
+
+
+async def _background_segment_keyframe(
+    project_id: str, frame_index: int, click_x: int, click_y: int
+):
+    """Segment only the selected keyframe and wait for user confirmation."""
     try:
         project_dir = project_manager.get_project_dir(project_id)
         frames_dir = project_dir / "frames"
@@ -205,7 +451,12 @@ async def _background_segment_and_propagate(project_id: str, frame_index: int, c
             )
             return
 
-        project_manager.update_status(project_id, segmenting=True, segment_status="segmenting")
+        project_manager.update_status(
+            project_id,
+            segmenting=True,
+            segment_status="segmenting",
+            segment_error=None,
+        )
 
         print(f"[SAM2] Starting segmentation for frame {frame_index} at ({click_x}, {click_y})")
         
@@ -213,7 +464,7 @@ async def _background_segment_and_propagate(project_id: str, frame_index: int, c
         loop = asyncio.get_event_loop()
         mask = await loop.run_in_executor(
             None,
-            sam2_service.segment_frame,
+            _segment_frame_serialized,
             frame_path,
             click_x,
             click_y
@@ -222,25 +473,90 @@ async def _background_segment_and_propagate(project_id: str, frame_index: int, c
 
         # Save mask for this frame only
         from PIL import Image
+        # A new click starts a new object track. Do not let masks from a
+        # previous selection make the next edit skip propagation.
+        for old_mask in masks_dir.glob("mask_*.png"):
+            old_mask.unlink()
         mask_img = (mask.astype(np.uint8)) * 255
         mask_path = masks_dir / f"mask_{frame_index:04d}.png"
         Image.fromarray(mask_img).save(mask_path)
+        from services import mask_service
+        mask_service.condition_single(mask_path)
         print(f"[SAM2] Saved mask to {mask_path}")
 
-        # Count existing masks to update mask_count
-        existing_masks = list(masks_dir.glob("mask_*.png"))
-        mask_count = len(existing_masks)
+        project_manager.update_status(
+            project_id, segmenting=False, segment_status="keyframe_ready",
+            mask_count=1, anchor_frame=frame_index,
+            click_x=click_x, click_y=click_y,
+            segment_error=None,
+        )
+        print(f"[SAM2] Keyframe mask ready; awaiting propagation confirmation")
+    except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        print(f"[SAM2] Error during keyframe segmentation: {str(e)}")
+        print(error_trace)
+        project_manager.update_status(
+            project_id,
+            segmenting=False,
+            segment_status="error",
+            segment_error=str(e),
+        )
+
+
+async def _background_propagate_segment(project_id: str):
+    """Track a confirmed keyframe mask through the complete clip."""
+    try:
+        project_dir = project_manager.get_project_dir(project_id)
+        frames_dir = project_dir / "frames"
+        masks_dir = project_dir / "masks"
+        status = project_manager.get_status(project_id)
+        frame_index = status.get("anchor_frame")
+        click_x = status.get("click_x")
+        click_y = status.get("click_y")
+        if not frame_index:
+            raise RuntimeError("No keyframe selection is ready")
+
+        mask_path = masks_dir / f"mask_{frame_index:04d}.png"
+        if not mask_path.exists():
+            raise RuntimeError("The keyframe mask is missing; select the object again")
+
+        from PIL import Image
+        from services import mask_service
 
         project_manager.update_status(
-            project_id, segmenting=False, segment_status="done",
-            mask_count=mask_count, anchor_frame=frame_index,
+            project_id,
+            segmenting=True,
+            segment_status="propagating",
+            segment_error=None,
         )
-        print(f"[SAM2] Segmentation complete for frame {frame_index}")
-        print(f"[SAM2] Updated status: segmenting=False, segment_status=done, mask_count={mask_count}")
-        
-        # Verify status was saved correctly
-        saved_status = project_manager.get_status(project_id)
-        print(f"[SAM2] Status after save: segmenting={saved_status.get('segmenting')}, segment_status={saved_status.get('segment_status')}, mask_count={saved_status.get('mask_count')}")
+        loop = asyncio.get_running_loop()
+        propagate = partial(
+            sam2_service.propagate_masks,
+            frames_dir,
+            frame_index,
+            (np.array(Image.open(mask_path).convert("L")) > 128),
+            masks_dir,
+            click_x=click_x,
+            click_y=click_y,
+            frame_step=config.get_mask_frame_step(),
+            cancel_check=lambda: _cancel_flags.get(project_id, False),
+        )
+        mask_count = await loop.run_in_executor(
+            None, _propagate_masks_serialized, propagate)
+        mask_service.stabilize_masks(masks_dir)
+        project_manager.update_status(
+            project_id,
+            segmenting=False,
+            segment_status="done",
+            mask_count=mask_count,
+            segment_error=None,
+        )
+        await asyncio.to_thread(supabase_storage_service.sync_checkpoint, project_id)
+        print(f"[SAM2] Full mask propagation complete: {mask_count} frames")
+    except sam2_service.PropagationCancelled:
+        project_manager.update_status(
+            project_id, segmenting=False, segment_status="cancelled")
     except Exception as e:
         import traceback
         error_trace = traceback.format_exc()
@@ -255,18 +571,34 @@ async def _background_segment_and_propagate(project_id: str, frame_index: int, c
 
 @app.post("/segment")
 async def segment_object(req: SegmentRequest, background_tasks: BackgroundTasks):
-    """Segment object at click point and propagate mask across frames."""
+    """Segment an object on one keyframe; propagation requires confirmation."""
     print(f"[SAM2] /segment endpoint called: project={req.project_id}, frame={req.frame_index}, click=({req.click_x}, {req.click_y})")
     
     project_dir = project_manager.get_project_dir(req.project_id)
     frame_path = project_dir / "frames" / f"frame_{req.frame_index:04d}.jpg"
 
+    current_status = project_manager.get_status(req.project_id)
+    if current_status.get("segment_status") in {"segmenting", "propagating"} or current_status.get("segmenting"):
+        return {"error": "Segmentation is already in progress."}
+    if current_status.get("edit_status") in {"uploading", "editing", "processing"}:
+        return {"error": "Wait for the current edit to finish before segmenting again."}
+
     if not frame_path.exists():
         print(f"[SAM2] Error: Frame not found at {frame_path}")
         return {"error": "Frame not found"}
 
+    # Mark the new request before scheduling the background task. This prevents
+    # polling from briefly treating a second click as the previous completed mask.
+    project_manager.update_status(
+        req.project_id,
+        segmenting=True,
+        segment_status="segmenting",
+        segment_error=None,
+    )
+    _cancel_flags[req.project_id] = False
+
     background_tasks.add_task(
-        _background_segment_and_propagate,
+        _background_segment_keyframe,
         req.project_id, req.frame_index, req.click_x, req.click_y,
     )
 
@@ -275,6 +607,34 @@ async def segment_object(req: SegmentRequest, background_tasks: BackgroundTasks)
         "status": "processing",
         "anchor_frame": req.frame_index,
     }
+
+
+class SegmentPropagationRequest(BaseModel):
+    project_id: str
+
+
+@app.post("/segment/propagate")
+async def propagate_segment(
+    req: SegmentPropagationRequest, background_tasks: BackgroundTasks
+):
+    """Propagate a prepared keyframe mask after explicit user confirmation."""
+    status = project_manager.get_status(req.project_id)
+    if status.get("segment_status") in {"segmenting", "propagating"} or status.get("segmenting"):
+        return {"error": "Segmentation is already in progress."}
+    if status.get("segment_status") != "keyframe_ready":
+        return {"error": "Select an object on a keyframe before tracking it."}
+    if status.get("edit_status") in {"uploading", "editing", "processing"}:
+        return {"error": "Wait for the current edit to finish before tracking the mask."}
+
+    _cancel_flags[req.project_id] = False
+    project_manager.update_status(
+        req.project_id,
+        segmenting=True,
+        segment_status="propagating",
+        segment_error=None,
+    )
+    background_tasks.add_task(_background_propagate_segment, req.project_id)
+    return {"project_id": req.project_id, "status": "propagating"}
 
 
 @app.get("/mask/{project_id}/{mask_index}")
@@ -286,265 +646,197 @@ async def get_mask(project_id: str, mask_index: int):
     return FileResponse(mask_path, media_type="image/png")
 
 
+@app.get("/mask-outline/{project_id}/{mask_index}")
+async def get_mask_outline(project_id: str, mask_index: int):
+    """Transparent accent contour for responsive editor playback."""
+    from fastapi.responses import Response
+    import cv2
+
+    project_dir = project_manager.get_project_dir(project_id)
+    mask_path = project_dir / "masks" / f"mask_{mask_index:04d}.png"
+    mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        raise HTTPException(status_code=404, detail="Mask not found")
+
+    hard = (mask > 128).astype(np.uint8) * 255
+    edge = cv2.morphologyEx(
+        hard,
+        cv2.MORPH_GRADIENT,
+        np.ones((3, 3), dtype=np.uint8),
+    )
+    rgba = np.zeros((*hard.shape, 4), dtype=np.uint8)
+    # OpenCV encodes BGRA; the FrameShift accent is RGB(244, 63, 94).
+    rgba[edge > 0] = (94, 63, 244, 255)
+    ok, encoded = cv2.imencode(".png", rgba)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Could not render mask outline")
+    return Response(
+        content=encoded.tobytes(),
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
 # --- Edit ---
 
 class EditRule(BaseModel):
-    edit_type: str  # core: recolor, resize, replace, add, delete
-                    # extras: bg_remove, bg_replace, gen_fill, enhance, upscale,
-                    #         restore, blur, blur_region, drop_shadow, gen_recolor
+    edit_type: str  # recolor, blur_region, color_pop, glow, resize, delete,
+                    # move, bg_replace, replace  (§6 dispatch table)
     start_frame: int
     end_frame: int
     color: Optional[str] = None       # hex without #, e.g. "FF0000"
     scale: Optional[float] = None     # for resize
-    prompt: Optional[str] = None      # for replace, add, bg_replace, gen_fill, gen_recolor
-    blur_strength: Optional[int] = None  # for blur (default 500)
-    asset_x: Optional[int] = None     # for add positioning
-    asset_y: Optional[int] = None
-    asset_w: Optional[int] = None
-    asset_h: Optional[int] = None
+    prompt: Optional[str] = None      # for replace / bg_replace
+    blur_strength: Optional[int] = None
+    dx: Optional[int] = None          # for move (frame-pixel offset)
+    dy: Optional[int] = None
+    backend: Optional[str] = None     # "B" forces synth backend for replace
+    preview_frame: Optional[int] = None  # frame the user is viewing — edit lands
+                                         # there first, then sweeps outward
 
 class EditRequest(BaseModel):
     project_id: str
     edit_rules: List[EditRule]
 
-def _save_edited_frame(frame_path: Path, edited_bytes: bytes):
-    """Save edited bytes to frame, resizing to match original dimensions if needed."""
-    from PIL import Image
-    orig = Image.open(frame_path)
-    orig_size = orig.size
-    orig.close()
-    edited = Image.open(BytesIO(edited_bytes))
-    if edited.size != orig_size:
-        print(f"[RESIZE] {frame_path.name}: {edited.size} -> {orig_size}")
-        edited = edited.resize(orig_size, Image.LANCZOS)
-    buf = BytesIO()
-    edited.save(buf, format="JPEG", quality=95)
-    frame_path.write_bytes(buf.getvalue())
 
+def _prepared_preview_generator(project_id: str, rule: EditRule):
+    """Return a generate-once wrapper for an approved generative preview."""
+    if rule.edit_type not in {"replace", "bg_replace"}:
+        return None
+    status = project_manager.get_status(project_id)
+    pending = status.get("pending_edit_preview") or {}
+    preview_frame = rule.preview_frame or rule.start_frame
+    if (
+        pending.get("edit_type") != rule.edit_type
+        or pending.get("frame_index") != preview_frame
+        or pending.get("prompt", "") != (rule.prompt or "")
+    ):
+        return None
 
-def _composite_with_mask(original_path, edited_path, mask_array):
-    """Blend edited image onto original using SAM2 mask: edited where mask=white, original elsewhere."""
-    from PIL import Image
-    original = np.array(Image.open(original_path).convert("RGB"))
-    edited = np.array(Image.open(edited_path).convert("RGB"))
+    preview_path = project_manager.get_project_dir(project_id) / "pending" / "edit_anchor.jpg"
+    if not preview_path.exists():
+        return None
 
-    # Resize mask to match frame dimensions if needed
-    mask = mask_array
-    if mask.shape[:2] != original.shape[:2]:
-        mask_img = Image.fromarray(mask).resize((original.shape[1], original.shape[0]), Image.NEAREST)
-        mask = np.array(mask_img)
+    if rule.edit_type == "replace":
+        from services import replace_tool
+        fallback = replace_tool._default_generate
+    else:
+        from services import background_tool
+        fallback = background_tool._default_generate
+    used = False
 
-    # Normalize mask to 0-1 float, expand to 3 channels
-    if mask.ndim == 3:
-        mask = mask[:, :, 0]
-    alpha = (mask > 0).astype(np.float32)[:, :, np.newaxis]
+    async def generate(frame_path, prompt, reference_frame_path=None, mask_path=None):
+        nonlocal used
+        if not used and reference_frame_path is None:
+            used = True
+            return preview_path.read_bytes()
+        return await fallback(
+            frame_path,
+            prompt,
+            reference_frame_path=reference_frame_path,
+            mask_path=mask_path,
+        )
 
-    # Resize edited to match original if Cloudinary changed dimensions
-    if edited.shape[:2] != original.shape[:2]:
-        edited_img = Image.fromarray(edited).resize((original.shape[1], original.shape[0]), Image.LANCZOS)
-        edited = np.array(edited_img)
+    return generate
 
-    result = (alpha * edited + (1 - alpha) * original).astype(np.uint8)
-    Image.fromarray(result).save(str(edited_path), quality=95)
-
-
-def _apply_recolor_local(frame_path, mask_array, color_hex: str):
-    """Apply color tint locally using SAM2 mask before Cloudinary upload."""
-    from PIL import Image
-    original = np.array(Image.open(frame_path).convert("RGB"))
-
-    mask = mask_array
-    if mask.shape[:2] != original.shape[:2]:
-        mask_img = Image.fromarray(mask).resize((original.shape[1], original.shape[0]), Image.NEAREST)
-        mask = np.array(mask_img)
-    if mask.ndim == 3:
-        mask = mask[:, :, 0]
-    alpha = (mask > 0).astype(np.float32)[:, :, np.newaxis]
-
-    # Parse hex color
-    color_hex = color_hex.lstrip("#")
-    r, g, b = int(color_hex[0:2], 16), int(color_hex[2:4], 16), int(color_hex[4:6], 16)
-    tint = np.full_like(original, [r, g, b])
-
-    # Blend: 60% original + 40% tint in masked region
-    tinted = (0.6 * original + 0.4 * tint).clip(0, 255).astype(np.uint8)
-    result = (alpha * tinted + (1 - alpha) * original).astype(np.uint8)
-
-    save_path = frame_path
-    Image.fromarray(result).save(str(save_path), quality=95)
-    return save_path
-
-
-# Edits are processed locally then delivered via Cloudinary
-from services import local_edit_service
-
-# Edits that require a mask (object-specific)
-MASK_EDITS = {"delete", "replace", "resize", "blur_region", "gen_recolor", "recolor"}
-# Edits that affect the whole frame
-FRAME_EDITS = {"bg_remove", "bg_replace", "gen_fill", "enhance", "upscale", "restore", "blur", "drop_shadow"}
 
 
 async def _background_edit(project_id: str, edit_rules: List[EditRule]):
-    """Background task: apply edits and upload results to Cloudinary."""
+    """Background task: route each rule through the §6 edit dispatch."""
     try:
-        from PIL import Image
         _cancel_flags[project_id] = False
-
         project_dir = project_manager.get_project_dir(project_id)
         frames_dir = project_dir / "frames"
-        masks_dir = project_dir / "masks"
         backups_dir = project_dir / "backups"
 
-        # Collect unique frame indices to edit
         frames_to_edit: set[int] = set()
         for rule in edit_rules:
             for i in range(rule.start_frame, rule.end_frame + 1):
                 frames_to_edit.add(i)
 
-        # Backup frames before editing
+        # Backup frames before editing (undo support)
         backups_dir.mkdir(exist_ok=True)
         import time
         backup_timestamp = str(int(time.time() * 1000))
         backup_dir = backups_dir / backup_timestamp
         backup_dir.mkdir(exist_ok=True)
-        
         for idx in sorted(frames_to_edit):
             frame_path = frames_dir / f"frame_{idx:04d}.jpg"
             if frame_path.exists():
-                backup_path = backup_dir / f"frame_{idx:04d}.jpg"
-                shutil.copy2(str(frame_path), str(backup_path))
-        
-        # Store backup info in status
+                shutil.copy2(str(frame_path), str(backup_dir / f"frame_{idx:04d}.jpg"))
+
+        total_frames = sum(
+            max(0, rule.end_frame - rule.start_frame + 1)
+            for rule in edit_rules
+        )
         project_manager.update_status(
             project_id,
             last_backup_timestamp=backup_timestamp,
-            last_backup_frames=list(frames_to_edit)
+            last_backup_frames=sorted(frames_to_edit),
+            edit_status="editing",
+            edit_error=None,
+            edit_phase="tracking",
+            edit_progress={"done": 0, "total": total_frames},
+            edit_sweep=None,
         )
 
-        total = len(frames_to_edit)
-        project_manager.update_status(project_id, edit_status="editing", edit_progress={"done": 0, "total": total})
-
-        completed = 0
-
-        for idx in sorted(frames_to_edit):
+        from services import edit_dispatch
+        completed_frames = 0
+        for rule in edit_rules:
             if _cancel_flags.get(project_id):
                 project_manager.update_status(project_id, edit_status="cancelled")
                 return
 
-            frame_path = frames_dir / f"frame_{idx:04d}.jpg"
-            if not frame_path.exists():
-                completed += 1
-                project_manager.update_status(project_id, edit_progress={"done": completed, "total": total})
-                continue
+            rule_total = max(0, rule.end_frame - rule.start_frame + 1)
 
-            mask_path = masks_dir / f"mask_{idx:04d}.png"
-            has_mask = mask_path.exists()
+            def update_progress(done: int, _total: int, base=completed_frames):
+                project_manager.update_status(
+                    project_id,
+                    edit_progress={
+                        "done": min(base + done, total_frames),
+                        "total": total_frames,
+                    },
+                )
 
-            for rule in edit_rules:
-                if rule.start_frame <= idx <= rule.end_frame:
-                    t = rule.edit_type
-                    print(f"[Edit] Frame {idx}: type={t}, has_mask={has_mask}")
+            prepared_generate = _prepared_preview_generator(project_id, rule)
+            try:
+                await edit_dispatch.run_edit_rule(
+                    project_id, rule,
+                    progress_cb=update_progress,
+                    cancel_check=lambda: _cancel_flags.get(project_id, False),
+                    generate=prepared_generate,
+                )
+            finally:
+                if prepared_generate is not None:
+                    pending_path = project_dir / "pending" / "edit_anchor.jpg"
+                    pending_path.unlink(missing_ok=True)
+                    project_manager.update_status(project_id, pending_edit_preview=None)
+            if _cancel_flags.get(project_id):
+                project_manager.update_status(project_id, edit_status="cancelled")
+                return
+            project_manager.update_status(project_id, edit_phase="editing")
+            completed_frames += rule_total
+            project_manager.update_status(
+                project_id,
+                edit_progress={"done": completed_frames, "total": total_frames},
+            )
 
-                    # ── Object edits (require mask) ──
-                    if t in MASK_EDITS:
-                        if not has_mask:
-                            print(f"[Edit] Skipping {t} - no mask for frame {idx}")
-                            break
-                            
-                        if t == "recolor":
-                            local_edit_service.apply_recolor(frame_path, mask_path, rule.color or "FF0000")
-                        elif t == "blur_region":
-                            local_edit_service.apply_blur_region(frame_path, mask_path, strength=10)
-                        elif t == "resize":
-                            local_edit_service.apply_resize(frame_path, mask_path, rule.scale or 1.5)
-                        elif t == "delete":
-                            local_edit_service.apply_remove(frame_path, mask_path)
-                        elif t == "replace":
-                            # Use Gemini AI to replace object
-                            try:
-                                edited_bytes = await gemini_service.edit_frame(
-                                    frame_path,
-                                    f"Replace the selected object with {rule.prompt or 'something similar'}",
-                                    mask_path=mask_path
-                                )
-                                # Save edited frame
-                                _save_edited_frame(frame_path, edited_bytes)
-                            except Exception as e:
-                                print(f"[Edit] Gemini replace failed for frame {idx}: {e}")
-                        elif t == "gen_recolor":
-                            # Use Gemini AI for AI-powered recolor
-                            try:
-                                color_desc = f"Change the color to {rule.color or 'FF0000'}"
-                                prompt = f"{rule.prompt or 'the selected object'}, {color_desc}"
-                                edited_bytes = await gemini_service.edit_frame(
-                                    frame_path,
-                                    prompt,
-                                    mask_path=mask_path
-                                )
-                                _save_edited_frame(frame_path, edited_bytes)
-                            except Exception as e:
-                                print(f"[Edit] Gemini AI recolor failed for frame {idx}: {e}")
-                                # Fallback to simple recolor
-                                if rule.color:
-                                    local_edit_service.apply_recolor(frame_path, mask_path, rule.color)
-
-                    # ── Whole-frame edits ──
-                    elif t in FRAME_EDITS:
-                        if t == "upscale":
-                            # Upscale only processes key frames (already filtered in frames_to_edit)
-                            local_edit_service.apply_upscale(frame_path, scale=2)
-                            print(f"[Edit] Upscaled key frame {idx}")
-                        elif t == "enhance":
-                            local_edit_service.apply_enhance(frame_path)
-                        elif t == "restore":
-                            local_edit_service.apply_restore(frame_path)
-                        elif t == "blur":
-                            local_edit_service.apply_blur(frame_path, strength=rule.blur_strength or 10)
-                        elif t == "bg_remove":
-                            # Use Gemini AI to remove background
-                            try:
-                                edited_bytes = await gemini_service.edit_frame(
-                                    frame_path,
-                                    "Remove the background, keep only the main subject",
-                                    mask_path=None
-                                )
-                                _save_edited_frame(frame_path, edited_bytes)
-                            except Exception as e:
-                                print(f"[Edit] Gemini bg_remove failed for frame {idx}: {e}")
-                        elif t == "bg_replace":
-                            # Use Gemini AI to replace background
-                            try:
-                                edited_bytes = await gemini_service.edit_frame(
-                                    frame_path,
-                                    f"Replace the background with {rule.prompt or 'a studio background'}",
-                                    mask_path=None
-                                )
-                                _save_edited_frame(frame_path, edited_bytes)
-                            except Exception as e:
-                                print(f"[Edit] Gemini bg_replace failed for frame {idx}: {e}")
-                        elif t == "gen_fill":
-                            # Use Gemini AI for generative fill
-                            try:
-                                edited_bytes = await gemini_service.edit_frame(
-                                    frame_path,
-                                    rule.prompt or "Fill the empty space naturally",
-                                    mask_path=None
-                                )
-                                _save_edited_frame(frame_path, edited_bytes)
-                            except Exception as e:
-                                print(f"[Edit] Gemini gen_fill failed for frame {idx}: {e}")
-
-                    break
-
-            completed += 1
-            project_manager.update_status(project_id, edit_progress={"done": completed, "total": total})
-
-        project_manager.update_status(project_id, edit_status="done", edit_progress={"done": total, "total": total})
-
+        project_manager.update_status(
+            project_id, edit_status="done",
+            edit_phase="done",
+            edit_progress={"done": total_frames, "total": total_frames},
+            edit_version=(project_manager.get_status(project_id).get("edit_version", 0) or 0) + 1,
+        )
+        await asyncio.to_thread(supabase_storage_service.sync_current_video, project_id)
     except Exception as e:
+        from services import edit_dispatch, sam2_service
+        if isinstance(e, (edit_dispatch.EditCancelled, sam2_service.PropagationCancelled)):
+            project_manager.update_status(project_id, edit_status="cancelled")
+            return
         import traceback
         traceback.print_exc()
-        project_manager.update_status(project_id, edit_status="error", edit_error=str(e))
+        project_manager.update_status(
+            project_id, edit_status="error", edit_phase="error", edit_error=str(e))
 
 
 class UndoRequest(BaseModel):
@@ -586,6 +878,7 @@ async def undo_edit(req: UndoRequest):
         last_backup_timestamp=None,  # Clear backup after undo
         last_backup_frames=[],
     )
+    await asyncio.to_thread(supabase_storage_service.sync_current_video, req.project_id)
     
     return {
         "status": "success",
@@ -599,15 +892,115 @@ async def edit_frames(req: EditRequest):
     project_dir = project_manager.get_project_dir(req.project_id)
     if not any((project_dir / "frames").glob("frame_*.jpg")):
         return {"error": "No frames found. Run /extract first."}
+    if not req.edit_rules:
+        return {"error": "No edit rules provided."}
 
-        project_manager.update_status(
-            req.project_id,
-            edit_status="editing",
-            edit_progress={"done": 0, "total": 0},
-        )
+    current_status = project_manager.get_status(req.project_id)
+    if current_status.get("segment_status") in {"segmenting", "propagating"} or current_status.get("segmenting"):
+        return {"error": "Wait for segmentation to finish before applying Blur."}
+    if current_status.get("edit_status") in {"uploading", "editing", "processing"}:
+        return {"error": "An edit is already being applied."}
+
+    project_manager.update_status(
+        req.project_id,
+        edit_status="editing",
+        edit_error=None,
+        edit_phase="tracking",
+        edit_progress={"done": 0, "total": 0},
+        edit_sweep=None,
+    )
     # Run as a proper async task instead of BackgroundTasks (which can't await)
     asyncio.ensure_future(_background_edit(req.project_id, req.edit_rules))
-    return {"project_id": req.project_id, "edit_status": "uploading"}
+    return {"project_id": req.project_id, "edit_status": "editing"}
+
+
+class PreviewRequest(BaseModel):
+    project_id: str
+    frame_index: int
+    edit_type: str
+    color: Optional[str] = None
+    blur_strength: Optional[int] = None
+    scale: Optional[float] = None
+    prompt: Optional[str] = None
+    dx: Optional[int] = None
+    dy: Optional[int] = None
+
+
+@app.post("/edit/preview")
+async def edit_preview(req: PreviewRequest):
+    """Instant single-frame preview: JPEG of the edit applied to one frame,
+    in memory. The durable propagation runs separately via /edit."""
+    from fastapi.responses import Response
+    from services import preview_service
+    try:
+        project_dir = project_manager.get_project_dir(req.project_id)
+        pending_dir = project_dir / "pending"
+        pending_path = pending_dir / "edit_anchor.jpg"
+        if req.edit_type in {"replace", "bg_replace"}:
+            frame_path = project_dir / "frames" / f"frame_{req.frame_index:04d}.jpg"
+            mask_path = project_dir / "masks" / f"mask_{req.frame_index:04d}.png"
+            if not frame_path.exists():
+                raise FileNotFoundError(f"Frame {req.frame_index} not found")
+            if not mask_path.exists():
+                raise RuntimeError("No mask — click an object first")
+            from services import gemini_service
+            validation = await gemini_service.validate_edit_prompt(
+                frame_path,
+                mask_path,
+                req.edit_type,
+                req.prompt or "",
+            )
+            if not validation.valid:
+                raise ValueError(
+                    f"Try again with a better prompt. {validation.reason}"
+                )
+            if req.edit_type == "replace":
+                from services import replace_tool
+                generated = await replace_tool._default_generate(
+                    frame_path, req.prompt or "", mask_path=mask_path)
+                jpeg = generated
+            else:
+                from services import background_tool, mask_service
+                import cv2
+                generated = await background_tool._default_generate(
+                    frame_path, req.prompt or "", mask_path=mask_path)
+                frame = cv2.imread(str(frame_path))
+                plate = cv2.imdecode(np.frombuffer(generated, np.uint8), cv2.IMREAD_COLOR)
+                if plate is None:
+                    raise RuntimeError("Generated background could not be decoded")
+                if plate.shape[:2] != frame.shape[:2]:
+                    plate = cv2.resize(plate, (frame.shape[1], frame.shape[0]))
+                matte = background_tool.soft_matte(
+                    frame, mask_service.load_mask_alpha(project_dir / "masks", req.frame_index)
+                )[..., None]
+                output = matte * frame.astype(np.float32) + (1 - matte) * plate.astype(np.float32)
+                ok, encoded = cv2.imencode(".jpg", np.clip(output, 0, 255).astype(np.uint8),
+                                           [cv2.IMWRITE_JPEG_QUALITY, 95])
+                if not ok:
+                    raise RuntimeError("Background preview could not be encoded")
+                jpeg = encoded.tobytes()
+            pending_dir.mkdir(parents=True, exist_ok=True)
+            pending_path.write_bytes(generated)
+            project_manager.update_status(
+                req.project_id,
+                pending_edit_preview={
+                    "edit_type": req.edit_type,
+                    "frame_index": req.frame_index,
+                    "prompt": req.prompt or "",
+                },
+            )
+        else:
+            pending_path.unlink(missing_ok=True)
+            project_manager.update_status(req.project_id, pending_edit_preview=None)
+            jpeg = await asyncio.to_thread(
+                preview_service.render_preview,
+                req.project_id, req.frame_index, req.edit_type,
+                color=req.color, blur_strength=req.blur_strength,
+                scale=req.scale, dx=req.dx or 0, dy=req.dy or 0)
+    except (ValueError, FileNotFoundError, RuntimeError) as e:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return Response(content=jpeg, media_type="image/jpeg")
 
 
 class CancelRequest(BaseModel):
@@ -627,754 +1020,14 @@ async def cancel_edit(req: CancelRequest):
     return {"status": "cancelled"}
 
 
-class RefineRequest(BaseModel):
-    project_id: str
-    frame_index: int  # 1-based
-    prompt: str = ""  # Optional extra context
-    start_frame: int = 0  # 0 = use frame_index only, otherwise process range
-    end_frame: int = 0  # 0 = use frame_index only
-
-
-@app.post("/edit/refine")
-async def refine_frame(req: RefineRequest):
-    """Use Gemini AI (nanobanana) to make frames look completely photorealistic.
-    If start_frame and end_frame are provided, processes only start and end frames within that range.
-    Otherwise, only processes the frame_index."""
+@app.post("/edit/preview/cancel")
+async def cancel_edit_preview(req: CancelRequest):
+    """Discard a prepared keyframe preview without touching project frames."""
     project_dir = project_manager.get_project_dir(req.project_id)
-    frames_dir = project_dir / "frames"
-    masks_dir = project_dir / "masks"
+    (project_dir / "pending" / "edit_anchor.jpg").unlink(missing_ok=True)
+    project_manager.update_status(req.project_id, pending_edit_preview=None)
+    return {"status": "cancelled"}
 
-    # Determine which frames to process (only start and end within boundaries)
-    if req.start_frame > 0 and req.end_frame > 0 and req.end_frame >= req.start_frame:
-        # Process only start and end frames within the range
-        frames_to_process = [req.start_frame]
-        if req.end_frame != req.start_frame:
-            frames_to_process.append(req.end_frame)
-    else:
-        # Process only the current frame
-        frames_to_process = [req.frame_index]
-
-    # Validate frames exist
-    for frame_idx in frames_to_process:
-        frame_path = frames_dir / f"frame_{frame_idx:04d}.jpg"
-        if not frame_path.exists():
-            return {"error": f"Frame {frame_idx} not found"}
-
-    project_manager.update_status(req.project_id, refine_status="processing", refine_progress={"done": 0, "total": len(frames_to_process)})
-
-    async def _background_refine():
-        try:
-            backups_dir = project_dir / "backups"
-            backups_dir.mkdir(exist_ok=True)
-            import time
-            backup_timestamp = str(int(time.time() * 1000))
-            backup_dir = backups_dir / backup_timestamp
-            backup_dir.mkdir(exist_ok=True)
-            
-            backup_frames = []
-            completed = 0
-            
-            for frame_idx in frames_to_process:
-                frame_path = frames_dir / f"frame_{frame_idx:04d}.jpg"
-                mask_path = masks_dir / f"mask_{frame_idx:04d}.png"
-                
-                # Backup frame before refining
-                backup_path = backup_dir / f"frame_{frame_idx:04d}.jpg"
-                shutil.copy2(str(frame_path), str(backup_path))
-                backup_frames.append(frame_idx)
-                
-                # Check if mask exists - if so, enhance only the segmented object
-                has_mask = mask_path.exists() if mask_path else False
-                
-                if has_mask:
-                    # Prompt to enhance only the segmented object while keeping the rest of the frame unchanged
-                    prompt = (
-                        f"Enhance only the selected/segmented object in this image to look completely photorealistic. "
-                        f"Apply realistic textures, natural lighting, proper shadows, reflections, and depth ONLY to the "
-                        f"segmented object. Keep the rest of the frame exactly as it is - do not change anything outside "
-                        f"the selected object. The background and other objects should remain completely unchanged. "
-                        f"Make the segmented object look like it was captured by a professional camera with realistic details, "
-                        f"but preserve the original structure and composition of the entire image. "
-                        f"{req.prompt if req.prompt else ''}"
-                    ).strip()
-                    # Apply enhancement only to the masked region
-                    edited_bytes = await gemini_service.edit_frame(frame_path, prompt, mask_path=mask_path)
-                else:
-                    # No mask - enhance entire frame (fallback behavior)
-                    prompt = (
-                        f"Transform this entire image into a completely photorealistic photograph. "
-                        f"Enhance every single object, person, and element in the frame to look like a high-quality, "
-                        f"professional photograph with natural lighting, realistic textures, proper shadows, reflections, "
-                        f"and depth. Make all objects in the scene look realistic and natural - enhance each one individually "
-                        f"while maintaining the overall composition. Make it look like it was captured by a professional camera. "
-                        f"Keep the same composition and subject matter, but make everything look more realistic, detailed, and natural. "
-                        f"{req.prompt if req.prompt else ''}"
-                    ).strip()
-                    # Apply enhancement to the entire frame
-                    edited_bytes = await gemini_service.edit_frame(frame_path, prompt, mask_path=None)
-                _save_edited_frame(frame_path, edited_bytes)
-                
-                completed += 1
-                project_manager.update_status(
-                    req.project_id,
-                    refine_progress={"done": completed, "total": len(frames_to_process)},
-                )
-            
-            project_manager.update_status(
-                req.project_id,
-                last_backup_timestamp=backup_timestamp,
-                last_backup_frames=backup_frames,
-                refine_status="done",
-                edit_version=(project_manager.get_status(req.project_id).get("edit_version", 0) or 0) + 1,
-            )
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            project_manager.update_status(
-                req.project_id,
-                refine_status="error",
-                refine_error=str(e),
-            )
-
-    asyncio.ensure_future(_background_refine())
-    return {"status": "processing"}
-
-
-class ChangeLogEntry(BaseModel):
-    id: str
-    projectId: str
-    timestamp: int
-    type: str  # "segment" | "edit" | "refine"
-    frameIndex: int
-    data: dict
-
-class PropagateRequest(BaseModel):
-    project_id: str
-    frame_index: int  # The edited reference frame (1-based)
-    prompt: str       # Description of the edit to propagate
-    start_frame: int = 1
-    end_frame: int = 0  # 0 = last frame
-    interval: int = 8
-    change_logs: list[ChangeLogEntry] = []  # All logged changes to replay
-
-
-@app.post("/edit/propagate")
-async def propagate_edit(req: PropagateRequest):
-    """Propagate all logged changes to every 15th frame using RIFE interpolation."""
-    project_dir = project_manager.get_project_dir(req.project_id)
-    frames_dir = project_dir / "frames"
-
-    # Use the specified range - if end_frame is 0 or same as start, use only start frame
-    start_frame = req.start_frame
-    end_frame = req.end_frame
-    
-    # If end_frame is 0 or not set, only process the start frame
-    if end_frame == 0 or end_frame < start_frame:
-        end_frame = start_frame
-    
-    # Ensure we don't exceed available frames
-    status = project_manager.get_status(req.project_id)
-    max_frames = status.get("frame_count", len(list(frames_dir.glob("frame_*.jpg"))))
-    end_frame = min(end_frame, max_frames)
-    start_frame = min(start_frame, max_frames)
-
-    project_manager.update_status(
-        req.project_id,
-        ai_edit_status="processing",
-        ai_edit_phase="transforming",
-        ai_edit_progress={"done": 0, "total": 0},
-        ai_interpolation_progress={"done": 0, "total": 0},
-        ai_generation_id=None,
-    )
-
-    # Process change logs sequentially - only within the specified range
-    asyncio.ensure_future(_background_propagate_changes(
-        req.project_id,
-        req.change_logs or [],
-        start_frame,
-        end_frame,
-        interval=15,  # Apply to every 15th frame
-    ))
-
-    return {"project_id": req.project_id, "status": "processing"}
-
-
-# --- AI Edit ---
-
-class AIPreviewRequest(BaseModel):
-    project_id: str
-    frame_index: int
-    prompt: str
-
-class AIAcceptRequest(BaseModel):
-    project_id: str
-    generation_id: str
-    start_frame: int
-    end_frame: int
-    interval: int = 15  # Gen AI every Nth frame between start and end
-
-class AIRejectRequest(BaseModel):
-    project_id: str
-    generation_id: str
-
-class AIRetryRequest(BaseModel):
-    project_id: str
-    generation_id: str
-
-@app.post("/ai/edit/preview")
-async def ai_edit_preview(req: AIPreviewRequest):
-    """Generate a preview of AI edit on a single frame."""
-    project_dir = project_manager.get_project_dir(req.project_id)
-    frames_dir = project_dir / "frames"
-    masks_dir = project_dir / "masks"
-    previews_dir = project_dir / "previews"
-    previews_dir.mkdir(exist_ok=True)
-
-    frame_path = frames_dir / f"frame_{req.frame_index:04d}.jpg"
-    if not frame_path.exists():
-        return {"error": f"Frame {req.frame_index} not found"}
-
-    # Load mask for preview frame if available
-    mask_path = masks_dir / f"mask_{req.frame_index:04d}.png"
-    mask_path_param = mask_path if mask_path.exists() else None
-
-    # Generate preview using Gemini
-    try:
-        print(f"Generating preview for frame {req.frame_index} with prompt: {req.prompt}")
-        if mask_path_param:
-            print(f"Using mask for preview: {mask_path_param}")
-        preview_bytes = await gemini_service.edit_frame(frame_path, req.prompt, mask_path=mask_path_param)
-        print(f"Preview generated successfully, size: {len(preview_bytes)} bytes")
-        
-        # Save preview
-        generation_id = str(uuid.uuid4())
-        preview_path = previews_dir / f"preview_{generation_id}.jpg"
-        preview_path.write_bytes(preview_bytes)
-        print(f"Preview saved to: {preview_path}")
-
-        # Store generation metadata
-        project_manager.update_status(
-            req.project_id,
-            ai_generation_id=generation_id,
-            ai_preview_url=f"/preview/{req.project_id}/{generation_id}",
-            ai_prompt=req.prompt,
-            ai_original_frame=req.frame_index,
-            ai_edit_status="preview",
-        )
-
-        return {
-            "generation_id": generation_id,
-            "preview_url": f"/preview/{req.project_id}/{generation_id}",
-        }
-    except Exception as e:
-        import traceback
-        error_trace = traceback.format_exc()
-        print(f"Error generating preview: {str(e)}")
-        print(error_trace)
-        return {"error": f"{str(e)}"}
-
-
-@app.get("/preview/{project_id}/{generation_id}")
-async def get_preview(project_id: str, generation_id: str):
-    """Serve preview image."""
-    from fastapi import HTTPException
-    project_dir = project_manager.get_project_dir(project_id)
-    preview_path = project_dir / "previews" / f"preview_{generation_id}.jpg"
-    if not preview_path.exists():
-        raise HTTPException(status_code=404, detail="Preview not found")
-    return FileResponse(str(preview_path), media_type="image/jpeg")
-
-
-@app.post("/ai/edit/accept")
-async def ai_edit_accept(req: AIAcceptRequest):
-    """Accept preview and propagate transformation to all frames."""
-    print(f"Accept endpoint called: project_id={req.project_id}, generation_id={req.generation_id}")
-    project_dir = project_manager.get_project_dir(req.project_id)
-    status = project_manager.get_status(req.project_id)
-
-    current_status = status.get("ai_edit_status")
-    if current_status == "processing":
-        return {"error": "Edit already in progress", "status": "processing"}
-
-    stored_generation_id = status.get("ai_generation_id")
-    if stored_generation_id and stored_generation_id != req.generation_id:
-        return {"error": "Invalid generation_id"}
-    if stored_generation_id is None:
-        return {"error": "This preview was already processed"}
-
-    previews_dir = project_dir / "previews"
-    preview_path = previews_dir / f"preview_{req.generation_id}.jpg"
-    if not preview_path.exists():
-        return {"error": "Preview not found"}
-
-    prompt = status.get("ai_prompt", "") or "Apply the same visual edit consistently"
-
-    project_manager.update_status(
-        req.project_id,
-        ai_edit_status="processing",
-        ai_edit_progress={"done": 0, "total": 0},
-        ai_generation_id=None,
-    )
-
-    asyncio.ensure_future(_background_ai_edit(
-        req.project_id,
-        req.generation_id,
-        preview_path,
-        prompt,
-        req.start_frame,
-        req.end_frame,
-        req.interval,
-    ))
-
-    return {"status": "processing"}
-
-
-@app.post("/ai/edit/reject")
-async def ai_edit_reject(req: AIRejectRequest):
-    """Reject preview and clear it."""
-    project_manager.update_status(
-        req.project_id,
-        ai_generation_id=None,
-        ai_preview_url=None,
-        ai_prompt=None,
-        ai_edit_status="idle",
-    )
-    return {"status": "rejected"}
-
-
-@app.post("/ai/edit/retry")
-async def ai_edit_retry(req: AIRetryRequest):
-    """Retry generation with same prompt."""
-    project_dir = project_manager.get_project_dir(req.project_id)
-    status = project_manager.get_status(req.project_id)
-    
-    if status.get("ai_generation_id") != req.generation_id:
-        return {"error": "Invalid generation_id"}
-    
-    prompt = status.get("ai_prompt", "")
-    if not prompt:
-        return {"error": "Prompt not found"}
-    
-    # Get the original frame index from status
-    frame_index = status.get("ai_original_frame", 1)
-    
-    frames_dir = project_dir / "frames"
-    frame_path = frames_dir / f"frame_{frame_index:04d}.jpg"
-    if not frame_path.exists():
-        return {"error": f"Frame {frame_index} not found"}
-
-    try:
-        preview_bytes = await gemini_service.edit_frame(frame_path, prompt)
-        
-        # Generate new generation ID
-        new_generation_id = str(uuid.uuid4())
-        previews_dir = project_dir / "previews"
-        previews_dir.mkdir(exist_ok=True)
-        preview_path = previews_dir / f"preview_{new_generation_id}.jpg"
-        preview_path.write_bytes(preview_bytes)
-
-        project_manager.update_status(
-            req.project_id,
-            ai_generation_id=new_generation_id,
-            ai_preview_url=f"/preview/{req.project_id}/{new_generation_id}",
-            ai_original_frame=frame_index,
-            ai_edit_status="preview",
-        )
-
-        return {
-            "generation_id": new_generation_id,
-            "preview_url": f"/preview/{req.project_id}/{new_generation_id}",
-        }
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e)}
-
-
-async def _background_propagate_changes(
-    project_id: str,
-    change_logs: list[ChangeLogEntry],
-    start_frame: int,
-    end_frame: int,
-    interval: int = 15,
-):
-    """Background task: Apply all logged changes sequentially to every Nth frame, then interpolate with RIFE."""
-    try:
-        project_dir = project_manager.get_project_dir(project_id)
-        frames_dir = project_dir / "frames"
-        masks_dir = project_dir / "masks"
-        
-        # Calculate key frames: only start and end frames
-        key_frames = []
-        
-        # Always include start frame if it exists
-        start_path = frames_dir / f"frame_{start_frame:04d}.jpg"
-        if start_path.exists():
-            key_frames.append(start_frame)
-        
-        # Always include end frame if it's different from start and exists
-        if end_frame != start_frame:
-            end_path = frames_dir / f"frame_{end_frame:04d}.jpg"
-            if end_path.exists():
-                key_frames.append(end_frame)
-        
-        # Sort to ensure correct order
-        key_frames = sorted(set(key_frames))
-        
-        total_logs = len(change_logs)
-        total_key_frames = len(key_frames)
-        total_operations = total_logs * total_key_frames
-        
-        project_manager.update_status(
-            project_id,
-            ai_edit_phase="transforming",
-            ai_edit_progress={"done": 0, "total": total_operations},
-            ai_interpolation_progress={"done": 0, "total": 0},
-        )
-        
-        completed = 0
-        
-        # Process each change log sequentially
-        for log_idx, log_entry in enumerate(change_logs):
-            print(f"[Propagate] Processing change log {log_idx + 1}/{total_logs}: {log_entry.type}")
-            
-            # Apply this change to each key frame
-            for frame_idx in key_frames:
-                frame_path = frames_dir / f"frame_{frame_idx:04d}.jpg"
-                if not frame_path.exists():
-                    completed += 1
-                    project_manager.update_status(
-                        project_id,
-                        ai_edit_progress={"done": completed, "total": total_operations},
-                    )
-                    continue
-                
-                try:
-                    if log_entry.type == "segment":
-                        # Re-segment at the logged click point
-                        click_x = log_entry.data.get("clickX", 0)
-                        click_y = log_entry.data.get("clickY", 0)
-                        mask_path = masks_dir / f"mask_{frame_idx:04d}.png"
-                        
-                        # Segment this frame (simplified - in production you'd use SAM2 propagation)
-                        # For now, copy mask from original frame if available
-                        original_mask = masks_dir / f"mask_{log_entry.frameIndex + 1:04d}.png"
-                        if original_mask.exists() and original_mask != mask_path:
-                            shutil.copy2(str(original_mask), str(mask_path))
-                    
-                    elif log_entry.type == "edit":
-                        # Apply the edit
-                        edit_type = log_entry.data.get("editType")
-                        mask_path = masks_dir / f"mask_{frame_idx:04d}.png"
-                        has_mask = mask_path.exists()
-                        
-                        if edit_type in MASK_EDITS and not has_mask:
-                            print(f"[Propagate] Skipping {edit_type} - no mask for frame {frame_idx}")
-                            completed += 1
-                            project_manager.update_status(
-                                project_id,
-                                ai_edit_progress={"done": completed, "total": total_operations},
-                            )
-                            continue
-                        
-                        if edit_type == "recolor":
-                            local_edit_service.apply_recolor(frame_path, mask_path, log_entry.data.get("color", "FF0000"))
-                        elif edit_type == "blur_region":
-                            local_edit_service.apply_blur_region(frame_path, mask_path, strength=10)
-                        elif edit_type == "resize":
-                            local_edit_service.apply_resize(frame_path, mask_path, log_entry.data.get("scale", 1.5))
-                        elif edit_type == "delete":
-                            local_edit_service.apply_remove(frame_path, mask_path)
-                        elif edit_type == "replace":
-                            edited_bytes = await gemini_service.edit_frame(
-                                frame_path,
-                                log_entry.data.get("prompt", "Replace object"),
-                                mask_path=mask_path if has_mask else None,
-                            )
-                            _save_edited_frame(frame_path, edited_bytes)
-                    
-                    elif log_entry.type == "refine":
-                        # Apply refine (make realistic)
-                        mask_path = masks_dir / f"mask_{frame_idx:04d}.png"
-                        has_mask = mask_path.exists()
-                        
-                        prompt = log_entry.data.get("prompt", "Make this look completely photorealistic")
-                        if has_mask:
-                            prompt = f"{prompt}. Only enhance the segmented object, keep the rest unchanged."
-                        
-                        edited_bytes = await gemini_service.edit_frame(
-                            frame_path,
-                            prompt,
-                            mask_path=mask_path if has_mask else None,
-                        )
-                        _save_edited_frame(frame_path, edited_bytes)
-                    
-                    completed += 1
-                    project_manager.update_status(
-                        project_id,
-                        ai_edit_progress={"done": completed, "total": total_operations},
-                    )
-                    
-                except Exception as e:
-                    print(f"[Propagate] Error applying {log_entry.type} to frame {frame_idx}: {e}")
-                    completed += 1
-                    project_manager.update_status(
-                        project_id,
-                        ai_edit_progress={"done": completed, "total": total_operations},
-                    )
-        
-        print(f"[Propagate] All changes applied to key frames. Starting RIFE interpolation.")
-        
-        # Interpolate between key frames using RIFE (only within [start_frame, end_frame])
-        total_interpolation_frames = 0
-        interpolation_segments = []
-        for i in range(len(key_frames) - 1):
-            start_frame_idx = key_frames[i]
-            end_frame_idx = key_frames[i + 1]
-            frames_to_interpolate = []
-            for frame_idx in range(start_frame_idx + 1, end_frame_idx):
-                if frame_idx < start_frame or frame_idx > end_frame:
-                    continue
-                frame_path = frames_dir / f"frame_{frame_idx:04d}.jpg"
-                if frame_path.exists():
-                    frames_to_interpolate.append(frame_path)
-            if len(frames_to_interpolate) > 0:
-                frames_to_interpolate.sort(key=lambda p: int(p.stem.replace("frame_", "")) if p.stem.startswith("frame_") else 0)
-                total_interpolation_frames += len(frames_to_interpolate)
-                interpolation_segments.append((start_frame_idx, end_frame_idx, frames_to_interpolate))
-        
-        if total_interpolation_frames > 0:
-            project_manager.update_status(
-                project_id,
-                ai_edit_phase="interpolating",
-                ai_interpolation_progress={"done": 0, "total": total_interpolation_frames},
-            )
-            
-            async def interpolate_segment(start_frame_idx: int, end_frame_idx: int, frames_to_interpolate: list):
-                if len(frames_to_interpolate) == 0:
-                    return
-                start_path = frames_dir / f"frame_{start_frame_idx:04d}.jpg"
-                end_path = frames_dir / f"frame_{end_frame_idx:04d}.jpg"
-                if not start_path.exists() or not end_path.exists():
-                    return
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(
-                    None,
-                    lambda sp=start_path, ep=end_path, fl=frames_to_interpolate: rife_service.interpolate_pair(sp, ep, fl),
-                )
-                status = project_manager.get_status(project_id)
-                current_done = status.get("ai_interpolation_progress", {}).get("done", 0)
-                project_manager.update_status(
-                    project_id,
-                    ai_interpolation_progress={"done": current_done + len(frames_to_interpolate), "total": total_interpolation_frames},
-                )
-            
-            for start_frame_idx, end_frame_idx, frames_to_interpolate in interpolation_segments:
-                await interpolate_segment(start_frame_idx, end_frame_idx, frames_to_interpolate)
-            print(f"[Propagate] RIFE interpolation complete: {total_interpolation_frames} frames")
-        
-        project_manager.update_status(
-            project_id,
-            ai_edit_status="done",
-            ai_edit_phase="done",
-            ai_edit_progress={"done": total_operations, "total": total_operations},
-            ai_interpolation_progress={"done": total_interpolation_frames, "total": total_interpolation_frames},
-        )
-        print(f"[Propagate] Complete: applied {total_logs} changes to {total_key_frames} key frames, interpolated {total_interpolation_frames} in-between frames")
-        
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        project_manager.update_status(
-            project_id,
-            ai_edit_status="error",
-            ai_edit_error=str(e),
-        )
-
-
-async def _background_ai_edit(
-    project_id: str,
-    generation_id: str,
-    preview_path: Path,
-    prompt: str,
-    start_frame: int,
-    end_frame: int,
-    interval: int,
-):
-    """Background task: Apply AI transformation to start frame, every Nth frame, and end frame."""
-    try:
-        project_dir = project_manager.get_project_dir(project_id)
-        frames_dir = project_dir / "frames"
-        masks_dir = project_dir / "masks"
-        
-        # Key frames only within [start_frame, end_frame]: always start, then every interval-th, then end (only existing)
-        key_frames = []
-        # Always include start frame if it exists (so the selected start is never skipped)
-        start_path = frames_dir / f"frame_{start_frame:04d}.jpg"
-        if start_path.exists() and start_frame <= end_frame:
-            key_frames.append(start_frame)
-        for frame_idx in range(start_frame, end_frame + 1, interval):
-            if frame_idx in key_frames:
-                continue
-            frame_path = frames_dir / f"frame_{frame_idx:04d}.jpg"
-            if frame_path.exists():
-                key_frames.append(frame_idx)
-        # Ensure end frame is included if different from start and exists
-        if end_frame not in key_frames and start_frame <= end_frame:
-            end_path = frames_dir / f"frame_{end_frame:04d}.jpg"
-            if end_path.exists():
-                key_frames.append(end_frame)
-        # Only transform within start and end (defensive filter), then dedupe and sort
-        key_frames = sorted(set(f for f in key_frames if start_frame <= f <= end_frame))
-        
-        total = len(key_frames)
-        project_manager.update_status(
-            project_id,
-            ai_edit_phase="transforming",
-            ai_edit_progress={"done": 0, "total": total},
-            ai_interpolation_progress={"done": 0, "total": 0},
-        )
-        
-        # Process frames concurrently with a semaphore to limit concurrent requests
-        semaphore = asyncio.Semaphore(4)  # Process up to 4 frames concurrently
-        completed_count = 0
-        import time
-        
-        async def transform_frame(frame_idx: int, idx: int):
-            """Transform a single frame with concurrency control."""
-            nonlocal completed_count
-            frame_path = frames_dir / f"frame_{frame_idx:04d}.jpg"
-            if not frame_path.exists():
-                completed_count += 1
-                project_manager.update_status(
-                    project_id,
-                    ai_edit_progress={"done": completed_count, "total": total},
-                )
-                return
-            
-            # Print before acquiring semaphore to show when task starts
-            start_time = time.time()
-            print(f"[START] Transforming frame {frame_idx} ({idx + 1}/{total})")
-            
-            async with semaphore:
-                # Print when semaphore is acquired (should show concurrent execution)
-                print(f"[ACQUIRED] Frame {frame_idx} acquired semaphore at {time.time():.2f}")
-                
-                try:
-                    # Load mask for this frame if available
-                    mask_path = masks_dir / f"mask_{frame_idx:04d}.png"
-                    mask_path_param = mask_path if mask_path.exists() else None
-                    
-                    # Use reference frame for consistency
-                    edited_bytes = await gemini_service.edit_frame_with_reference(
-                        frame_path,
-                        prompt,
-                        preview_path,
-                        mask_path=mask_path_param,
-                    )
-
-                    # Save transformed frame (resizes to match original if needed)
-                    _save_edited_frame(frame_path, edited_bytes)
-                    
-                    elapsed = time.time() - start_time
-                    print(f"[DONE] Frame {frame_idx} completed in {elapsed:.2f}s")
-                    
-                    completed_count += 1
-                    project_manager.update_status(
-                        project_id,
-                        ai_edit_progress={"done": completed_count, "total": total},
-                    )
-                except Exception as e:
-                    print(f"[ERROR] Error transforming frame {frame_idx}: {e}")
-                    completed_count += 1
-                    project_manager.update_status(
-                        project_id,
-                        ai_edit_progress={"done": completed_count, "total": total},
-                    )
-                    raise
-        
-        # Process all frames concurrently (limited by semaphore)
-        print(f"[INFO] Starting concurrent transformation of {total} frames")
-        tasks = [transform_frame(frame_idx, idx) for idx, frame_idx in enumerate(key_frames)]
-        await asyncio.gather(*tasks)
-        
-        print(f"[INFO] AI transformation complete: transformed {total} key frames: {key_frames}")
-        
-        # Interpolate frames between key frames using RIFE (only within [start_frame, end_frame])
-        print(f"[INFO] Starting RIFE interpolation between key frames")
-        total_interpolation_frames = 0
-        interpolation_segments = []
-        for i in range(len(key_frames) - 1):
-            start_frame_idx = key_frames[i]
-            end_frame_idx = key_frames[i + 1]
-            frames_to_interpolate = []
-            for frame_idx in range(start_frame_idx + 1, end_frame_idx):
-                if frame_idx < start_frame or frame_idx > end_frame:
-                    continue
-                frame_path = frames_dir / f"frame_{frame_idx:04d}.jpg"
-                if frame_path.exists():
-                    frames_to_interpolate.append(frame_path)
-            if len(frames_to_interpolate) > 0:
-                # Strict ascending order so RIFE writes the right blend to each frame file
-                frames_to_interpolate.sort(key=lambda p: int(p.stem.replace("frame_", "")) if p.stem.startswith("frame_") else 0)
-                total_interpolation_frames += len(frames_to_interpolate)
-                interpolation_segments.append((start_frame_idx, end_frame_idx, frames_to_interpolate))
-        
-        if total_interpolation_frames > 0:
-            project_manager.update_status(
-                project_id,
-                ai_edit_phase="interpolating",
-                ai_interpolation_progress={"done": 0, "total": total_interpolation_frames},
-            )
-            
-            async def interpolate_segment(start_frame_idx: int, end_frame_idx: int, frames_to_interpolate: list):
-                """Interpolate frames between two key frames using RIFE."""
-                if len(frames_to_interpolate) == 0:
-                    return
-                start_path = frames_dir / f"frame_{start_frame_idx:04d}.jpg"
-                end_path = frames_dir / f"frame_{end_frame_idx:04d}.jpg"
-                if not start_path.exists() or not end_path.exists():
-                    print(f"[RIFE] Skipping interpolation: start or end frame missing")
-                    return
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(
-                    None,
-                    lambda sp=start_path, ep=end_path, fl=frames_to_interpolate: rife_service.interpolate_pair(sp, ep, fl),
-                )
-                print(f"[RIFE] Interpolated {len(frames_to_interpolate)} frames between {start_frame_idx} and {end_frame_idx}")
-                status = project_manager.get_status(project_id)
-                current_done = status.get("ai_interpolation_progress", {}).get("done", 0)
-                project_manager.update_status(
-                    project_id,
-                    ai_interpolation_progress={"done": current_done + len(frames_to_interpolate), "total": total_interpolation_frames},
-                )
-            
-            for start_frame_idx, end_frame_idx, frames_to_interpolate in interpolation_segments:
-                await interpolate_segment(start_frame_idx, end_frame_idx, frames_to_interpolate)
-            print(f"[INFO] RIFE interpolation complete: interpolated {total_interpolation_frames} frames")
-        
-        project_manager.update_status(
-            project_id,
-            ai_edit_status="done",
-            ai_edit_phase="done",
-            ai_edit_progress={"done": total, "total": total},
-            ai_interpolation_progress={"done": total_interpolation_frames, "total": total_interpolation_frames},
-            ai_edit_transformed_frames=key_frames,
-            ai_generation_id=None,
-        )
-        print(f"AI edit complete: transformed {total} key frames, interpolated {total_interpolation_frames} in-between frames")
-        
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        project_manager.update_status(
-            project_id,
-            ai_edit_status="error",
-            ai_edit_error=str(e),
-        )
-
-
-# --- Render ---
 
 class RenderRequest(BaseModel):
     project_id: str
@@ -1387,22 +1040,26 @@ async def render_video(req: RenderRequest):
     output_path = project_dir / "output.mp4"
 
     status = project_manager.get_status(req.project_id)
-    
+    fps = status.get("fps") or 30
+
     # Check if AI edits are done - use frames_dir, otherwise use edited_dir
     if status.get("ai_edit_status") == "done":
         # Use frames directory (contains AI-edited frames)
-        ffmpeg_service.encode_video(frames_dir, output_path)
+        ffmpeg_service.encode_video(frames_dir, output_path, fps=fps)
     else:
         # Check if regular edits are done
         if status.get("edit_status") not in ("done", None, "idle"):
             return {"error": f"Edit not complete. Current edit_status: {status.get('edit_status')}"}
-        
+
         edited_frames = sorted(edited_dir.glob("frame_*.jpg"))
         if len(edited_frames) == 0:
             # No edits - use original frames
-            ffmpeg_service.encode_video(frames_dir, output_path)
+            ffmpeg_service.encode_video(frames_dir, output_path, fps=fps)
         else:
-            ffmpeg_service.encode_video(edited_dir, output_path)
+            ffmpeg_service.encode_video(edited_dir, output_path, fps=fps)
+
+    await asyncio.to_thread(
+        supabase_storage_service.sync_export, req.project_id, output_path)
 
     # Return local file path
     return {

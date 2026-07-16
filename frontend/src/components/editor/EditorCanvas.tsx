@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef, useEffect } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { Detection, EditMode, EditParams } from "@/lib/mock-data";
 import { BoundingBox } from "./BoundingBox";
 import type { EditAction } from "./EditToolbar";
@@ -13,6 +13,8 @@ interface EditorCanvasProps {
   detections: Detection[];
   isDetecting: boolean;
   isSegmenting: boolean;
+  segmentStatus: string | null;
+  segmentAnchorFrame: number | null;
   maskCount: number;
   maskVersion: number;
   editVersion: number;
@@ -24,17 +26,42 @@ interface EditorCanvasProps {
   zoom: number;
   currentFrame: number;
   totalFrames: number;
+  fps: number;
+  isPlaying: boolean;
   frameWidth: number;
   frameHeight: number;
   previewFrameUrl: string | null;
+  instantPreviewUrl?: string | null;
+  instantPreviewFrame?: number | null;
+  pendingEditAction?: string | null;
+  isEditPreviewing?: boolean;
   aiEditStatus: "idle" | "preview" | "applying" | "done";
   storageBaseUrl: string | null;
+  storedVideoUrl?: string | null;
+  onFrameReadyChange?: (ready: boolean) => void;
+  onPlaybackFrame?: (frame: number) => void;
+  onPlaybackEnded?: () => void;
   onSelectObject: (id: string | null) => void;
   onUpload: () => void;
   onApplyEdit: (action: EditAction, params: { color?: string; prompt?: string; scale?: number }) => void;
   onSegmentAtPoint: (clickX: number, clickY: number) => void;
+  onConfirmPropagation: () => void;
+  onConfirmEditPropagation: () => void;
+  onCancelEditPreview: () => void;
   onCancelEdit: () => void;
 }
+
+const EDIT_LABELS: Record<string, string> = {
+  delete: "Remove",
+  recolor: "Recolor",
+  resize: "Resize",
+  blur_region: "Blur",
+  move: "Move",
+  color_pop: "Color Pop",
+  glow: "Glow",
+  replace: "Replace",
+  bg_replace: "Replace Background",
+};
 
 export function EditorCanvas({
   projectId,
@@ -42,6 +69,8 @@ export function EditorCanvas({
   detections,
   isDetecting,
   isSegmenting,
+  segmentStatus,
+  segmentAnchorFrame,
   maskCount,
   maskVersion,
   editVersion,
@@ -53,23 +82,41 @@ export function EditorCanvas({
   zoom,
   currentFrame,
   totalFrames,
+  fps,
+  isPlaying,
   frameWidth,
   frameHeight,
   previewFrameUrl,
+  instantPreviewUrl,
+  instantPreviewFrame,
+  pendingEditAction,
+  isEditPreviewing,
   aiEditStatus,
   storageBaseUrl,
+  storedVideoUrl,
+  onFrameReadyChange,
+  onPlaybackFrame,
+  onPlaybackEnded,
   onSelectObject,
   onUpload,
   onApplyEdit,
   onSegmentAtPoint,
+  onConfirmPropagation,
+  onConfirmEditPropagation,
+  onCancelEditPreview,
   onCancelEdit,
 }: EditorCanvasProps) {
   const imgRef = useRef<HTMLDivElement>(null);
-  const borderCanvasRef = useRef<HTMLCanvasElement>(null);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [frameReady, setFrameReady] = useState(false);
+  const [frameRetry, setFrameRetry] = useState(0);
+  const hasMaskForCurrentFrame = maskCount > 0 && (
+    segmentStatus === "done" || segmentAnchorFrame === currentFrame + 1
+  );
 
   const handleCanvasClick = useCallback(
     (e: React.MouseEvent) => {
-      if (!imgRef.current || !frameWidth || !frameHeight) {
+      if (!frameReady || isProcessing || isSegmenting || !imgRef.current || !frameWidth || !frameHeight) {
         return;
       }
       e.stopPropagation();
@@ -82,96 +129,73 @@ export function EditorCanvas({
       const clickY = Math.round(relY * frameHeight);
       onSegmentAtPoint(clickX, clickY);
     },
-    [frameWidth, frameHeight, onSegmentAtPoint]
+    [frameHeight, frameReady, frameWidth, isProcessing, isSegmenting, onSegmentAtPoint]
   );
-
-  // Draw border outline on canvas when mask exists
-  useEffect(() => {
-    if (!borderCanvasRef.current || !projectId || maskCount === 0 || isSegmenting || aiEditStatus === "preview") {
-      return;
-    }
-
-    const canvas = borderCanvasRef.current;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    // Set canvas size to match container
-    const rect = canvas.getBoundingClientRect();
-    canvas.width = rect.width;
-    canvas.height = rect.height;
-
-    // Load mask image
-    const maskImg = new Image();
-    maskImg.crossOrigin = "anonymous";
-    maskImg.onload = () => {
-      // Clear canvas
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-      // Calculate scaling to fit mask in canvas
-      const scaleX = canvas.width / maskImg.width;
-      const scaleY = canvas.height / maskImg.height;
-      const scale = Math.min(scaleX, scaleY);
-      const x = (canvas.width - maskImg.width * scale) / 2;
-      const y = (canvas.height - maskImg.height * scale) / 2;
-
-      // Draw mask to get pixel data
-      ctx.drawImage(maskImg, x, y, maskImg.width * scale, maskImg.height * scale);
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const data = imageData.data;
-
-      // Clear canvas again
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-      // Find edges and draw glowing border
-      ctx.strokeStyle = "rgba(244,63,94,1)";
-      ctx.lineWidth = 3;
-      ctx.shadowBlur = 8;
-      ctx.shadowColor = "rgba(244,63,94,1)";
-
-      // Simple edge detection - draw border where mask pixels meet non-mask pixels
-      for (let y = 1; y < canvas.height - 1; y++) {
-        for (let x = 1; x < canvas.width - 1; x++) {
-          const idx = (y * canvas.width + x) * 4;
-          const isMask = data[idx] > 128; // White pixel in mask
-
-          // Check neighbors
-          const topIdx = ((y - 1) * canvas.width + x) * 4;
-          const bottomIdx = ((y + 1) * canvas.width + x) * 4;
-          const leftIdx = (y * canvas.width + (x - 1)) * 4;
-          const rightIdx = (y * canvas.width + (x + 1)) * 4;
-
-          const topIsMask = data[topIdx] > 128;
-          const bottomIsMask = data[bottomIdx] > 128;
-          const leftIsMask = data[leftIdx] > 128;
-          const rightIsMask = data[rightIdx] > 128;
-
-          // Draw pixel if it's on the edge
-          if (isMask && (!topIsMask || !bottomIsMask || !leftIsMask || !rightIsMask)) {
-            ctx.fillStyle = "rgba(244,63,94,1)";
-            ctx.fillRect(x, y, 1, 1);
-          }
-        }
-      }
-    };
-    maskImg.src = `${API_URL}/mask/${projectId}/${currentFrame + 1}?v=${maskVersion}`;
-  }, [projectId, currentFrame, maskCount, maskVersion, isSegmenting, aiEditStatus, frameWidth, frameHeight]);
-
-  if (!videoLoaded) {
-    return <EmptyCanvas onUpload={onUpload} />;
-  }
 
   // Show preview frame if in preview mode, otherwise show current frame
   // Use per-frame versioning for transformed frames, otherwise use global editVersion
   const currentFrameIndex = currentFrame + 1; // Backend uses 1-based indexing
   const frameVersion = transformedFrameVersions?.[currentFrameIndex] ?? editVersion;
   const paddedIndex = String(currentFrameIndex).padStart(4, "0");
-  const frameUrl = aiEditStatus === "preview" && previewFrameUrl
+  // Instant preview wins for its own frame — the edit appears the moment the
+  // button is pressed, then the propagated real frame replaces it
+  const frameUrl = instantPreviewUrl != null && instantPreviewFrame === currentFrame
+    ? instantPreviewUrl
+    : aiEditStatus === "preview" && previewFrameUrl
     ? previewFrameUrl
     : projectId
     ? storageBaseUrl && frameVersion === 0
       ? `${storageBaseUrl}/frame_${paddedIndex}.jpg`
       : `${API_URL}/frame/${projectId}/${currentFrameIndex}?v=${frameVersion}`
     : null;
+  const retryableFrameUrl = frameUrl
+    ? frameUrl.startsWith("blob:") || frameUrl.startsWith("data:")
+      ? frameUrl
+      : `${frameUrl}${frameUrl.includes("?") ? "&" : "?"}retry=${frameRetry}`
+    : null;
+
+  useEffect(() => {
+    setFrameReady(false);
+    onFrameReadyChange?.(false);
+    return () => {
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+    };
+  }, [currentFrame, frameUrl, frameVersion, onFrameReadyChange]);
+
+  const handleFrameLoaded = () => {
+    if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+    setFrameReady(true);
+    onFrameReadyChange?.(true);
+  };
+
+  const handleFrameError = () => {
+    setFrameReady(false);
+    onFrameReadyChange?.(false);
+    if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+    retryTimerRef.current = setTimeout(() => {
+      setFrameRetry((retry) => retry + 1);
+    }, 2000);
+  };
+
+  if (!videoLoaded) {
+    if (storedVideoUrl) {
+      return <StoredVideoCanvas videoUrl={storedVideoUrl} />;
+    }
+    return <EmptyCanvas onUpload={onUpload} />;
+  }
+
+  if (isPlaying && storedVideoUrl) {
+    return (
+      <SynchronizedPlaybackCanvas
+        videoUrl={storedVideoUrl}
+        currentFrame={currentFrame}
+        totalFrames={totalFrames}
+        fps={fps}
+        onFrameChange={onPlaybackFrame}
+        onEnded={onPlaybackEnded}
+      />
+    );
+  }
 
   return (
     <div
@@ -188,19 +212,44 @@ export function EditorCanvas({
       >
         <div
           ref={imgRef}
-          className="w-[768px] h-[432px] rounded-2xl overflow-hidden relative shadow-2xl cursor-crosshair"
+          className="w-[min(768px,calc(100vw-340px))] aspect-video rounded-2xl overflow-hidden relative shadow-2xl cursor-crosshair"
           style={{
             background: "var(--ed-surface-2)",
             boxShadow: "0 25px 60px rgba(0,0,0,0.25)",
           }}
           onClick={handleCanvasClick}
         >
-          {frameUrl ? (
+          {frameReady && !isSegmenting && !hasMaskForCurrentFrame && aiEditStatus !== "preview" && (
+            <div className="absolute top-4 left-1/2 -translate-x-1/2 z-10 pointer-events-none rounded-xl border px-4 py-2 text-center backdrop-blur-md"
+              style={{
+                background: "rgba(10, 10, 10, 0.72)",
+                borderColor: "rgba(255,255,255,0.14)",
+              }}
+            >
+              <p className="text-xs font-semibold text-white">Click an object to start</p>
+              <p className="mt-0.5 text-[10px] text-white/60">SAM 2 will isolate your selection</p>
+            </div>
+          )}
+
+          {!frameReady && storedVideoUrl && (
+            <video
+              src={storedVideoUrl}
+              controls
+              playsInline
+              preload="metadata"
+              className="absolute inset-0 z-0 h-full w-full bg-black object-contain"
+              onClick={(event) => event.stopPropagation()}
+            />
+          )}
+
+          {retryableFrameUrl ? (
             <>
               <img
-                src={frameUrl}
+                src={retryableFrameUrl}
                 alt={aiEditStatus === "preview" ? "AI Preview" : `Frame ${currentFrame + 1}`}
-                className="absolute inset-0 w-full h-full object-contain pointer-events-none"
+                className={`absolute inset-0 z-[1] h-full w-full object-contain transition-opacity ${frameReady ? "opacity-100" : "pointer-events-none opacity-0"}`}
+                onLoad={handleFrameLoaded}
+                onError={handleFrameError}
               />
               {aiEditStatus === "preview" && (
                 <div className="absolute top-4 left-4 z-30 px-3 py-1.5 rounded-xl text-xs font-medium border"
@@ -222,15 +271,21 @@ export function EditorCanvas({
             </div>
           )}
 
+          {!frameReady && (
+            <div className="pointer-events-none absolute left-1/2 top-4 z-20 -translate-x-1/2 rounded-full border border-white/10 bg-black/70 px-4 py-2 text-[10px] font-medium text-white/70 backdrop-blur">
+              Restoring editor frames…
+            </div>
+          )}
+
 
           {/* Hide masks and detections when showing AI preview */}
-          {aiEditStatus !== "preview" && projectId && maskCount > 0 && !isSegmenting && (
+          {frameReady && aiEditStatus !== "preview" && projectId && hasMaskForCurrentFrame && !isSegmenting && (
             <>
-              {/* Draw border outline on canvas - no mask overlay */}
-              <canvas
-                ref={borderCanvasRef}
-                className="absolute inset-0 w-full h-full pointer-events-none z-[2]"
-                style={{ objectFit: "contain" }}
+              <img
+                src={`${API_URL}/mask-outline/${projectId}/${currentFrameIndex}?v=${maskVersion}`}
+                alt=""
+                className="absolute inset-0 w-full h-full object-contain pointer-events-none z-[2]"
+                style={{ filter: "drop-shadow(0 0 3px rgba(244,63,94,0.9))" }}
               />
 
             </>
@@ -243,7 +298,94 @@ export function EditorCanvas({
                 style={{ background: "rgba(0,0,0,0.7)", borderColor: "rgba(255,255,255,0.1)" }}
               >
                 <div className="w-6 h-6 border-2 border-[var(--accent)] border-t-transparent rounded-full animate-spin" />
-                <span className="text-white/70 text-xs font-medium">Segmenting…</span>
+                <span className="text-white/70 text-xs font-medium">
+                  {segmentStatus === "propagating" ? "Tracking object through video…" : "Segmenting keyframe…"}
+                </span>
+              </div>
+            </div>
+          )}
+
+          {isEditPreviewing && (
+            <div className="absolute inset-0 flex items-center justify-center z-30 pointer-events-none">
+              <div
+                className="flex flex-col items-center gap-2 px-5 py-3.5 rounded-2xl border"
+                style={{ background: "rgba(0,0,0,0.76)", borderColor: "rgba(255,255,255,0.12)" }}
+              >
+                <div className="w-6 h-6 border-2 border-[var(--accent)] border-t-transparent rounded-full animate-spin" />
+                <span className="text-white/75 text-xs font-medium">
+                  {pendingEditAction === "replace" || pendingEditAction === "bg_replace"
+                    ? `Gemini is generating the ${EDIT_LABELS[pendingEditAction]} keyframe…`
+                    : `Preparing ${pendingEditAction ? EDIT_LABELS[pendingEditAction] || pendingEditAction : "edit"} preview…`}
+                </span>
+                <span className="text-white/40 text-[10px]">Current frame only</span>
+              </div>
+            </div>
+          )}
+
+          {segmentStatus === "keyframe_ready" && !isSegmenting && (
+            <div
+              className="absolute bottom-4 left-1/2 -translate-x-1/2 z-30 w-[360px] rounded-2xl border p-4 shadow-2xl backdrop-blur-xl"
+              style={{ background: "rgba(15,15,18,0.92)", borderColor: "rgba(255,255,255,0.14)" }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="flex items-start gap-3">
+                <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-400">
+                  ✓
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-semibold text-white">Keyframe selection ready</p>
+                  <p className="mt-1 text-xs leading-5 text-white/60">
+                    Track this object through all {totalFrames} frames?
+                  </p>
+                  <button
+                    type="button"
+                    onClick={onConfirmPropagation}
+                    className="mt-3 w-full rounded-xl bg-[var(--accent)] px-4 py-2.5 text-xs font-semibold text-white transition hover:brightness-110"
+                  >
+                    Segment all frames
+                  </button>
+                  <p className="mt-2 text-center text-[10px] text-white/40">
+                    Or click another point to adjust the selection
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {pendingEditAction && !isEditPreviewing && instantPreviewUrl && (
+            <div
+              className="absolute bottom-4 left-1/2 -translate-x-1/2 z-30 w-[380px] rounded-2xl border p-4 shadow-2xl backdrop-blur-xl"
+              style={{ background: "rgba(15,15,18,0.94)", borderColor: "rgba(255,255,255,0.14)" }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="flex items-start gap-3">
+                <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-400">
+                  ✓
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-semibold text-white">
+                    {EDIT_LABELS[pendingEditAction] || pendingEditAction} preview ready
+                  </p>
+                  <p className="mt-1 text-xs leading-5 text-white/60">
+                    Apply this change to all {totalFrames} frames?
+                  </p>
+                  <div className="mt-3 flex gap-2">
+                    <button
+                      type="button"
+                      onClick={onCancelEditPreview}
+                      className="flex-1 rounded-xl border border-white/15 px-4 py-2.5 text-xs font-semibold text-white/70 transition hover:bg-white/5"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      onClick={onConfirmEditPropagation}
+                      className="flex-[1.5] rounded-xl bg-[var(--accent)] px-4 py-2.5 text-xs font-semibold text-white transition hover:brightness-110"
+                    >
+                      Apply to all frames
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
           )}
@@ -256,6 +398,127 @@ export function EditorCanvas({
               onClick={() => onSelectObject(det.id)}
             />
           ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StoredVideoCanvas({ videoUrl }: { videoUrl: string }) {
+  return (
+    <div
+      className="flex flex-1 items-center justify-center p-8"
+      style={{ background: "var(--ed-bg)" }}
+    >
+      <div className="w-full max-w-[900px]">
+        <div className="overflow-hidden rounded-2xl bg-black shadow-2xl">
+          <video
+            src={videoUrl}
+            controls
+            playsInline
+            preload="metadata"
+            className="aspect-video w-full object-contain"
+          />
+        </div>
+        <div
+          className="mx-auto mt-4 flex w-fit items-center gap-2 rounded-full border px-4 py-2 text-xs"
+          style={{
+            background: "var(--ed-surface)",
+            borderColor: "var(--ed-border)",
+            color: "var(--ed-muted)",
+          }}
+        >
+          <span className="h-2 w-2 rounded-full bg-emerald-500" />
+          Video saved in Supabase · GPU editor is preparing
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SynchronizedPlaybackCanvas({
+  videoUrl,
+  currentFrame,
+  totalFrames,
+  fps,
+  onFrameChange,
+  onEnded,
+}: {
+  videoUrl: string;
+  currentFrame: number;
+  totalFrames: number;
+  fps: number;
+  onFrameChange?: (frame: number) => void;
+  onEnded?: () => void;
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const lastReportedFrameRef = useRef(currentFrame);
+  const safeFps = Math.max(fps, 1);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    const startPlayback = () => {
+      video.currentTime = Math.max(0, currentFrame / safeFps);
+      void video.play().catch(() => {
+        // Muted inline playback is normally allowed. If the browser still
+        // blocks it, the next explicit timeline click will retry playback.
+      });
+    };
+
+    if (video.readyState >= HTMLMediaElement.HAVE_METADATA) {
+      startPlayback();
+    } else {
+      video.addEventListener("loadedmetadata", startPlayback, { once: true });
+    }
+
+    return () => video.removeEventListener("loadedmetadata", startPlayback);
+    // Mounting this canvas is the play action. Frame changes are synchronized
+    // separately so they do not restart the video every frame.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videoUrl]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || video.readyState < HTMLMediaElement.HAVE_METADATA) return;
+    const targetTime = currentFrame / safeFps;
+    if (Math.abs(video.currentTime - targetTime) > 0.5) {
+      video.currentTime = targetTime;
+    }
+  }, [currentFrame, safeFps]);
+
+  const reportCurrentFrame = () => {
+    const video = videoRef.current;
+    if (!video || totalFrames <= 0) return;
+    const frame = Math.min(
+      totalFrames - 1,
+      Math.max(0, Math.floor(video.currentTime * safeFps)),
+    );
+    if (frame === lastReportedFrameRef.current) return;
+    lastReportedFrameRef.current = frame;
+    onFrameChange?.(frame);
+  };
+
+  return (
+    <div
+      className="flex flex-1 items-center justify-center overflow-hidden relative"
+      style={{ background: "var(--ed-bg)" }}
+    >
+      <div className="relative w-[min(768px,calc(100vw-340px))] aspect-video overflow-hidden rounded-2xl bg-black shadow-2xl">
+        <video
+          ref={videoRef}
+          src={videoUrl}
+          autoPlay
+          muted
+          playsInline
+          preload="auto"
+          className="h-full w-full object-contain"
+          onTimeUpdate={reportCurrentFrame}
+          onEnded={onEnded}
+        />
+        <div className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 rounded-full border border-white/10 bg-black/70 px-4 py-2 text-[10px] font-medium text-white/75 backdrop-blur">
+          Playing video · Pause to edit this frame
         </div>
       </div>
     </div>

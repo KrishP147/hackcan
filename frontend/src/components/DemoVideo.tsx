@@ -1,25 +1,22 @@
 export function DemoVideo() {
   return (
-    <div className="max-w-4xl mx-auto px-4">
-      <div className="relative aspect-video bg-[var(--surface-dark)] rounded-2xl overflow-hidden">
-        <video
-          src="/FrameShift.mp4"
-          controls
-          playsInline
-          className="w-full h-full object-contain"
-          poster="/Thumbnail.png"
-        >
-          Your browser does not support the video tag.
-        </video>
+    <section className="w-full px-6 py-16 md:px-12" aria-label="FrameShift product demo">
+      <div className="mx-auto max-w-6xl">
+        <div className="overflow-hidden rounded-[2rem] border border-black/10 bg-black shadow-[0_28px_80px_rgba(23,23,23,0.16)]">
+          <video
+            src="/frameshift-demo.mp4"
+            controls
+            autoPlay
+            loop
+            muted
+            playsInline
+            preload="metadata"
+            className="block h-auto w-full"
+          >
+            Your browser does not support HTML video.
+          </video>
+        </div>
       </div>
-
-      {/* Timeline Bar */}
-      <div className="flex h-1.5 mt-3 rounded-full overflow-hidden gap-0.5">
-        <div className="bg-[#F43F5E] rounded-full" style={{ width: "30%" }} />
-        <div className="bg-[#F59E0B] rounded-full" style={{ width: "25%" }} />
-        <div className="bg-[#0EA5E9] rounded-full" style={{ width: "20%" }} />
-        <div className="bg-[#10B981] rounded-full" style={{ width: "25%" }} />
-      </div>
-    </div>
+    </section>
   );
 }

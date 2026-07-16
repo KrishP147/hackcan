@@ -9,6 +9,7 @@ interface VideoProject {
   uploadedAt: number;
   status?: string;
   frameCount?: number;
+  storagePath?: string;
 }
 
 interface VideoStore {
@@ -76,6 +77,22 @@ export const useVideoStore = create<VideoStore>()(
     }),
     {
       name: "video-storage", // localStorage key
+      // Clear the pre-auth development history once. Those entries used the
+      // retired short project IDs and cannot reliably map to Modal/Supabase.
+      // Version 2 clears the former browser-wide history. Account history now
+      // comes exclusively from the authenticated Supabase projects query.
+      version: 2,
+      migrate: (persistedState, version) => {
+        const state = persistedState as VideoStore;
+        if (version < 2) {
+          return {
+            ...state,
+            projects: [],
+            currentProjectId: null,
+          };
+        }
+        return state;
+      },
     }
   )
 );
